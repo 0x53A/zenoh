@@ -6151,6 +6151,7 @@ name = "zenoh-collections"
 version = "1.8.0"
 dependencies = [
  "ahash",
+ "getrandom 0.3.4",
 ]
 
 [[package]]
@@ -6628,11 +6629,13 @@ dependencies = [
 name = "zenoh-runtime"
 version = "1.8.0"
 dependencies = [
+ "flume",
  "lazy_static",
  "ron",
  "serde",
  "tokio",
  "tracing",
+ "wasm-bindgen-futures",
  "zenoh-macros",
  "zenoh-result",
 ]
