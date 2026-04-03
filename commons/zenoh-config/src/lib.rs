@@ -62,7 +62,9 @@ use zenoh_protocol::{
     transport::{BatchSize, TransportSn},
 };
 use zenoh_result::{bail, zerror, ZResult};
-use zenoh_util::{LibLoader, LibSearchDirs};
+#[cfg(not(target_arch = "wasm32"))]
+use zenoh_util::LibLoader;
+use zenoh_util::LibSearchDirs;
 
 pub mod mode_dependent;
 pub use mode_dependent::*;
@@ -1379,6 +1381,7 @@ impl Config {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn libloader(&self) -> LibLoader {
         if self.plugins_loading.enabled {
             LibLoader::new(self.plugins_loading.search_dirs().clone())

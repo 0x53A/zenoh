@@ -20,13 +20,18 @@
 use lazy_static::lazy_static;
 
 pub mod ffi;
+#[cfg(not(target_arch = "wasm32"))]
 mod lib_loader;
 pub mod lib_search_dirs;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod net;
 pub mod time_range;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use lib_loader::*;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod timer;
+#[cfg(not(target_arch = "wasm32"))]
 pub use timer::*;
 pub mod log;
 pub use lib_search_dirs::*;
@@ -35,9 +40,11 @@ pub use log::*;
 /// The "ZENOH_HOME" environment variable name
 pub const ZENOH_HOME_ENV_VAR: &str = "ZENOH_HOME";
 
+#[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_ZENOH_HOME_DIRNAME: &str = ".zenoh";
 
 /// Return the path to the ${ZENOH_HOME} directory (~/.zenoh by default).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn zenoh_home() -> &'static std::path::Path {
     use std::path::PathBuf;
     lazy_static! {
