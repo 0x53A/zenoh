@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "zenoh-wasm-client-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zenoh = { path = "../../zenoh", default-features = false, features = ["transport_ws"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["console", "Document", "Element", "HtmlElement", "Window"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tracing-web = "0.1"
