@@ -17,7 +17,10 @@
 //! This crate is intended for Zenoh's internal use.
 //!
 //! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
-use std::{net::SocketAddr, str::FromStr};
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::net::SocketAddr;
+use std::str::FromStr;
 
 use async_trait::async_trait;
 use url::Url;
@@ -28,15 +31,18 @@ use zenoh_protocol::{
     transport::BatchSize,
 };
 use zenoh_result::{bail, ZResult};
-mod unicast;
-pub use unicast::*;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod unicast_native;
+#[cfg(not(target_arch = "wasm32"))]
+pub use unicast_native::*;
+
+#[cfg(target_arch = "wasm32")]
+mod unicast_wasm;
+#[cfg(target_arch = "wasm32")]
+pub use unicast_wasm::*;
 
 // Default MTU (WSS PDU) in bytes.
-// NOTE: Since TCP is a byte-stream oriented transport, theoretically it has
-//       no limit regarding the MTU. However, given the batching strategy
-//       adopted in Zenoh and the usage of 16 bits in Zenoh to encode the
-//       payload length in byte-streamed, the TCP MTU is constrained to
-//       2^16 - 1 bytes (i.e., 65535).
 const WS_MAX_MTU: BatchSize = BatchSize::MAX;
 
 pub const WS_LOCATOR_PREFIX: &str = "ws";
@@ -76,6 +82,7 @@ zconfigurable! {
     static ref TCP_ACCEPT_THROTTLE_TIME: u64 = 100_000;
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn get_ws_addr(address: Address<'_>) -> ZResult<SocketAddr> {
     match tokio::net::lookup_host(address.as_str()).await?.next() {
         Some(addr) => Ok(addr),
@@ -83,6 +90,7 @@ pub async fn get_ws_addr(address: Address<'_>) -> ZResult<SocketAddr> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn get_ws_url(address: Address<'_>) -> ZResult<Url> {
     match Url::parse(&format!(
         "{}://{}",

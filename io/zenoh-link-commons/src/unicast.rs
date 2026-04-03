@@ -37,6 +37,7 @@ pub trait LinkManagerUnicastTrait: Send + Sync {
     async fn get_listeners(&self) -> Vec<EndPoint>;
     async fn get_locators(&self) -> Vec<Locator>;
 }
+
 pub type NewLinkChannelSender = flume::Sender<LinkUnicast>;
 
 pub trait ConstructibleLinkManagerUnicast<T>: Sized {

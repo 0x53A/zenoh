@@ -6495,12 +6495,18 @@ name = "zenoh-link-ws"
 version = "1.8.0"
 dependencies = [
  "async-trait",
+ "flume",
+ "futures",
  "futures-util",
+ "js-sys",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
  "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "zenoh-core",
  "zenoh-link-commons",
  "zenoh-protocol",
