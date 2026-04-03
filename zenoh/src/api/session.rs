@@ -2663,6 +2663,7 @@ impl Session {
             .spawn_with_rt(zenoh_runtime::ZRuntime::Net, {
                 let session = self.downgrade();
                 async move {
+                    #[cfg(not(target_arch = "wasm32"))]
                     tokio::select! {
                         _ = tokio::time::sleep(timeout) => {
                             let mut state = zwrite!(session.0.state);
@@ -2682,6 +2683,12 @@ impl Session {
                             }
                         }
                         _ = token.cancelled() => {}
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        // On WASM, tokio::time is not available; just wait for cancellation
+                        let _ = timeout;
+                        token.cancelled().await;
                     }
                 }
             });
@@ -2799,6 +2806,7 @@ impl Session {
             .spawn_with_rt(zenoh_runtime::ZRuntime::Net, {
                 let session = self.downgrade();
                 async move {
+                    #[cfg(not(target_arch = "wasm32"))]
                     tokio::select! {
                         _ = tokio::time::sleep(timeout) => {
                             let mut state = zwrite!(session.0.state);
@@ -2813,6 +2821,12 @@ impl Session {
                             }
                         }
                         _ = token.cancelled() => {}
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        // On WASM, tokio::time is not available; just wait for cancellation
+                        let _ = timeout;
+                        token.cancelled().await;
                     }
                 }
             });

@@ -13,37 +13,44 @@
 //
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, Ipv6Addr, SocketAddr},
     ops::DerefMut,
     str::FromStr,
     time::Duration,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use futures::{prelude::*, stream::FuturesUnordered};
+#[cfg(not(target_arch = "wasm32"))]
 use socket2::{Domain, Socket, Type};
-use tokio::{
-    net::UdpSocket,
-    sync::{futures::Notified, Mutex, Notify},
-};
-use tokio_util::sync::CancellationToken;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::net::UdpSocket;
+use tokio::sync::{futures::Notified, Mutex, Notify};
+use zenoh_task::CancellationToken;
+#[cfg(not(target_arch = "wasm32"))]
 use zenoh_buffers::{
     reader::{DidntRead, HasReader},
     writer::HasWriter,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use zenoh_codec::{RCodec, WCodec, Zenoh080};
 use zenoh_config::{
     get_global_connect_timeout, get_global_listener_timeout, unwrap_or_default,
     ConnectionRetryPeriod, ModeDependent,
 };
 use zenoh_link::{Locator, LocatorInspector};
+use zenoh_protocol::core::{EndPoint, Metadata, PriorityRange, WhatAmI, ZenohIdProto};
+#[cfg(not(target_arch = "wasm32"))]
 use zenoh_protocol::{
-    core::{whatami::WhatAmIMatcher, EndPoint, Metadata, PriorityRange, WhatAmI, ZenohIdProto},
+    core::whatami::WhatAmIMatcher,
     scouting::{HelloProto, Scout, ScoutingBody, ScoutingMessage},
 };
 use zenoh_result::{bail, zerror, ZResult};
 
 use super::{Runtime, RuntimeSession};
-use crate::net::{common::AutoConnect, protocol::linkstate::LinkInfo};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::common::AutoConnect;
+use crate::net::protocol::linkstate::LinkInfo;
 
 const RCV_BUF_SIZE: usize = u16::MAX as usize;
 const SCOUT_INITIAL_PERIOD: Duration = Duration::from_millis(1_000);
@@ -130,6 +137,7 @@ impl Runtime {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn start_client(&self) -> ZResult<()> {
         let (listeners, peers, scouting, listen, autoconnect, addr, ifaces, timeout, multicast_ttl) = {
             let guard = &self.state.config.lock();
@@ -201,6 +209,36 @@ impl Runtime {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    async fn start_client(&self) -> ZResult<()> {
+        let (listeners, peers) = {
+            let guard = &self.state.config.lock();
+            (
+                guard
+                    .listen()
+                    .endpoints()
+                    .client()
+                    .unwrap_or(&vec![])
+                    .clone(),
+                guard
+                    .connect()
+                    .endpoints()
+                    .client()
+                    .unwrap_or(&vec![])
+                    .clone(),
+            )
+        };
+
+        self.bind_listeners(&listeners).await?;
+
+        if peers.is_empty() {
+            bail!("No peer specified and multicast scouting is not available on WASM!")
+        } else {
+            self.connect_peers(&peers, true).await
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     async fn start_peer(&self) -> ZResult<()> {
         let (listeners, peers, scouting, wait_scouting, listen, autoconnect, addr, ifaces, delay) = {
             let guard = &self.state.config.lock();
@@ -242,6 +280,27 @@ impl Runtime {
         Ok(())
     }
 
+    #[cfg(target_arch = "wasm32")]
+    async fn start_peer(&self) -> ZResult<()> {
+        let (listeners, peers) = {
+            let guard = &self.state.config.lock();
+            (
+                guard.listen().endpoints().peer().unwrap_or(&vec![]).clone(),
+                guard
+                    .connect()
+                    .endpoints()
+                    .peer()
+                    .unwrap_or(&vec![])
+                    .clone(),
+            )
+        };
+
+        self.bind_listeners(&listeners).await?;
+        self.connect_peers(&peers, false).await?;
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     async fn start_router(&self) -> ZResult<()> {
         let (listeners, peers, scouting, listen, autoconnect, addr, ifaces, delay) = {
             let guard = &self.state.config.lock();
@@ -279,6 +338,32 @@ impl Runtime {
         Ok(())
     }
 
+    #[cfg(target_arch = "wasm32")]
+    async fn start_router(&self) -> ZResult<()> {
+        let (listeners, peers) = {
+            let guard = &self.state.config.lock();
+            (
+                guard
+                    .listen()
+                    .endpoints()
+                    .router()
+                    .unwrap_or(&vec![])
+                    .clone(),
+                guard
+                    .connect()
+                    .endpoints()
+                    .router()
+                    .unwrap_or(&vec![])
+                    .clone(),
+            )
+        };
+
+        self.bind_listeners(&listeners).await?;
+        self.connect_peers(&peers, false).await?;
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     async fn start_scout(
         &self,
         listen: bool,
@@ -335,17 +420,25 @@ impl Runtime {
         if timeout.is_zero() {
             self.connect_peers_impl(peers, single_link).await
         } else {
-            let res = tokio::time::timeout(timeout, async {
-                self.connect_peers_impl(peers, single_link).await
-            })
-            .await;
-            match res {
-                Ok(r) => r,
-                Err(_) => {
-                    let e = zerror!("Unable to connect to any of {:?}. Timeout!", peers);
-                    tracing::warn!("{}", &e);
-                    Err(e.into())
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let res = tokio::time::timeout(timeout, async {
+                    self.connect_peers_impl(peers, single_link).await
+                })
+                .await;
+                match res {
+                    Ok(r) => r,
+                    Err(_) => {
+                        let e = zerror!("Unable to connect to any of {:?}. Timeout!", peers);
+                        tracing::warn!("{}", &e);
+                        Err(e.into())
+                    }
                 }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                // On WASM, tokio::time is not available; connect without timeout
+                self.connect_peers_impl(peers, single_link).await
             }
         }
     }
@@ -470,16 +563,24 @@ impl Runtime {
         if timeout.is_zero() {
             self.bind_listeners_impl(listeners).await
         } else {
-            let res = tokio::time::timeout(timeout, async {
-                self.bind_listeners_impl(listeners).await.ok()
-            })
-            .await;
-            match res {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    tracing::error!("Unable to open listeners: {}", e);
-                    Err(Box::new(e))
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let res = tokio::time::timeout(timeout, async {
+                    self.bind_listeners_impl(listeners).await.ok()
+                })
+                .await;
+                match res {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        tracing::error!("Unable to open listeners: {}", e);
+                        Err(Box::new(e))
+                    }
                 }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                // On WASM, tokio::time is not available; bind without timeout
+                self.bind_listeners_impl(listeners).await
             }
         }
     }
@@ -530,7 +631,14 @@ impl Runtime {
             if self.add_listener(listener.clone()).await.is_ok() {
                 break;
             }
+            #[cfg(not(target_arch = "wasm32"))]
             tokio::time::sleep(period.next_duration()).await;
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = period.next_duration();
+                // On WASM, tokio::time is not available; yield instead
+                tokio::task::yield_now().await;
+            }
         }
     }
 
@@ -554,6 +662,7 @@ impl Runtime {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn get_interfaces(names: &str) -> Vec<IpAddr> {
         if names == "auto" {
             let ifaces = zenoh_util::net::get_multicast_interfaces();
@@ -588,6 +697,7 @@ impl Runtime {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn bind_mcast_port(
         sockaddr: &SocketAddr,
         ifaces: &[IpAddr],
@@ -682,6 +792,7 @@ impl Runtime {
         Ok(udp_socket)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn bind_ucast_port(addr: IpAddr, multicast_ttl: u32) -> ZResult<UdpSocket> {
         let sockaddr = || SocketAddr::new(addr, 0);
         let socket = match Socket::new(Domain::for_address(sockaddr()), Type::DGRAM, None) {
@@ -761,12 +872,28 @@ impl Runtime {
             wait_time: Duration,
             cancellation_token: CancellationToken,
         ) -> Option<(EndPoint, ConnectionRetryPeriod)> {
-            tokio::select! {
-                _ = tokio::time::sleep(wait_time) => {
-                    Some((peer, period))
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                tokio::select! {
+                    _ = tokio::time::sleep(wait_time) => {
+                        Some((peer, period))
+                    }
+                    _ = cancellation_token.cancelled() => {
+                        None
+                    }
                 }
-                _ = cancellation_token.cancelled() => {
-                    None
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                // On WASM, tokio::time is not available; yield then retry immediately
+                let _ = wait_time;
+                tokio::select! {
+                    _ = async { tokio::task::yield_now().await } => {
+                        Some((peer, period))
+                    }
+                    _ = cancellation_token.cancelled() => {
+                        None
+                    }
                 }
             }
         }
@@ -844,6 +971,7 @@ impl Runtime {
             .map(|peers| peers[0])
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn scout<Fut, F>(
         sockets: &[UdpSocket],
         matcher: WhatAmIMatcher,
@@ -1077,6 +1205,7 @@ impl Runtime {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn connect_first(
         &self,
         sockets: &[UdpSocket],
@@ -1109,6 +1238,7 @@ impl Runtime {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn autoconnect_all(
         &self,
         ucast_sockets: &[UdpSocket],
@@ -1131,6 +1261,7 @@ impl Runtime {
         .await
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn responder(&self, mcast_socket: &UdpSocket, ucast_sockets: &[UdpSocket]) {
         fn get_best_match<'a>(addr: &IpAddr, sockets: &'a [UdpSocket]) -> Option<&'a UdpSocket> {
             fn octets(addr: &IpAddr) -> Vec<u8> {

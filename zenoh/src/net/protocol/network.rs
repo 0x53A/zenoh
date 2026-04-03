@@ -635,7 +635,13 @@ impl Network {
                 // random backoff
                 let sleep_time =
                     std::time::Duration::from_millis(rand::thread_rng().gen_range(0..100));
+                #[cfg(not(target_arch = "wasm32"))]
                 tokio::time::sleep(sleep_time).await;
+                #[cfg(target_arch = "wasm32")]
+                {
+                    // On WASM, tokio::time is not available; proceed without delay
+                    let _ = sleep_time;
+                }
                 runtime.connect_peer(&zid, &locators).await;
             }
         });

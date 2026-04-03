@@ -202,9 +202,16 @@ impl From<&NEVec<DownsamplingMessage>> for DownsamplingFilters {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Timestate {
     pub threshold: tokio::time::Duration,
     pub latest_message_timestamp: tokio::time::Instant,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct Timestate {
+    pub threshold: std::time::Duration,
+    pub latest_message_timestamp: std::time::Instant,
 }
 
 pub(crate) struct DownsamplingInterceptor {
@@ -269,7 +276,10 @@ impl InterceptorTrait for DownsamplingInterceptor {
             tracing::debug!("unexpected cache ID {}", id);
             return true;
         };
+        #[cfg(not(target_arch = "wasm32"))]
         let timestamp = tokio::time::Instant::now();
+        #[cfg(target_arch = "wasm32")]
+        let timestamp = std::time::Instant::now();
         if timestamp - state.latest_message_timestamp >= state.threshold {
             state.latest_message_timestamp = timestamp;
             true
@@ -304,11 +314,27 @@ impl DownsamplingInterceptor {
         let mut ke_id = KeBoxTree::default();
         let mut ke_state = HashMap::default();
         for (id, rule) in rules.into_iter().enumerate() {
-            let mut threshold = tokio::time::Duration::MAX;
-            let mut latest_message_timestamp = tokio::time::Instant::now();
+            #[cfg(not(target_arch = "wasm32"))]
+            let (mut threshold, mut latest_message_timestamp) = (
+                tokio::time::Duration::MAX,
+                tokio::time::Instant::now(),
+            );
+            #[cfg(target_arch = "wasm32")]
+            let (mut threshold, mut latest_message_timestamp) = (
+                std::time::Duration::from_secs(u64::MAX / 2),
+                std::time::Instant::now(),
+            );
             if rule.freq != 0.0 {
-                threshold =
-                    tokio::time::Duration::from_nanos((1. / rule.freq * NANOS_PER_SEC) as u64);
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    threshold =
+                        tokio::time::Duration::from_nanos((1. / rule.freq * NANOS_PER_SEC) as u64);
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    threshold =
+                        std::time::Duration::from_nanos((1. / rule.freq * NANOS_PER_SEC) as u64);
+                }
                 latest_message_timestamp -= threshold;
             }
             ke_id.insert(&rule.key_expr, id);

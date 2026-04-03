@@ -19,7 +19,7 @@ use std::{
 
 use async_trait::async_trait;
 use itertools::Itertools;
-use tokio_util::sync::CancellationToken;
+use zenoh_task::CancellationToken;
 use zenoh_buffers::ZBuf;
 #[allow(unused_imports)]
 use zenoh_core::polyfill::*;
@@ -33,6 +33,7 @@ use zenoh_protocol::{
     zenoh::{self, ResponseBody},
 };
 use zenoh_sync::get_mut_unchecked;
+#[cfg(not(target_arch = "wasm32"))]
 use zenoh_util::Timed;
 
 use super::{
@@ -446,8 +447,13 @@ impl QueryCleanup {
             drop(queries_lock);
             face.task_controller
                 .spawn_with_rt(zenoh_runtime::ZRuntime::Net, async move {
+                    #[cfg(not(target_arch = "wasm32"))]
                     tokio::select! {
                         _ = tokio::time::sleep(timeout) => { cleanup.run().await }
+                        _ = c_cancellation_token.cancelled() => {}
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    tokio::select! {
                         _ = c_cancellation_token.cancelled() => {}
                     }
                 });
@@ -455,6 +461,7 @@ impl QueryCleanup {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl Timed for QueryCleanup {
     async fn run(&mut self) {

@@ -10,17 +10,18 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+#[cfg(not(target_arch = "wasm32"))]
 mod dynamic_plugin;
 mod static_plugin;
 
 use zenoh_keyexpr::keyexpr;
 use zenoh_result::ZResult;
+#[cfg(not(target_arch = "wasm32"))]
 use zenoh_util::LibLoader;
 
-use self::{
-    dynamic_plugin::{DynamicPlugin, DynamicPluginSource},
-    static_plugin::StaticPlugin,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use self::dynamic_plugin::{DynamicPlugin, DynamicPluginSource};
+use self::static_plugin::StaticPlugin;
 use crate::*;
 
 pub trait DeclaredPlugin<StartArgs, Instance>: PluginStatus {
@@ -103,6 +104,7 @@ impl<StartArgs: PluginStartArgs, Instance: PluginInstance> DeclaredPlugin<StartA
 /// Plugins can be loaded from shared libraries using [`Self::declare_dynamic_plugin_by_name`] or [`Self::declare_dynamic_plugin_by_paths`], or added directly from the binary if available using [`Self::declare_static_plugin`].
 pub struct PluginsManager<StartArgs: PluginStartArgs, Instance: PluginInstance> {
     default_lib_prefix: String,
+    #[cfg(not(target_arch = "wasm32"))]
     loader: Option<LibLoader>,
     plugins: Vec<PluginRecord<StartArgs, Instance>>,
 }
@@ -111,6 +113,7 @@ impl<StartArgs: PluginStartArgs + 'static, Instance: PluginInstance + 'static>
     PluginsManager<StartArgs, Instance>
 {
     /// Constructs a new plugin manager with dynamic library loading enabled.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn dynamic<S: Into<String>>(loader: LibLoader, default_lib_prefix: S) -> Self {
         PluginsManager {
             default_lib_prefix: default_lib_prefix.into(),
@@ -122,6 +125,7 @@ impl<StartArgs: PluginStartArgs + 'static, Instance: PluginInstance + 'static>
     pub fn static_plugins_only() -> Self {
         PluginsManager {
             default_lib_prefix: String::new(),
+            #[cfg(not(target_arch = "wasm32"))]
             loader: None,
             plugins: Default::default(),
         }
@@ -155,6 +159,7 @@ impl<StartArgs: PluginStartArgs + 'static, Instance: PluginInstance + 'static>
     }
 
     /// Add dynamic plugin to the manager by name, automatically prepending the default library prefix
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn declare_dynamic_plugin_by_name<S: Into<String>>(
         &mut self,
         id: S,
@@ -191,6 +196,7 @@ impl<StartArgs: PluginStartArgs + 'static, Instance: PluginInstance + 'static>
     }
 
     /// Add first available dynamic plugin from the list of paths to the plugin files
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn declare_dynamic_plugin_by_paths<S: Into<String>, P: AsRef<str> + std::fmt::Debug>(
         &mut self,
         name: S,

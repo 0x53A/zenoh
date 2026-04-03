@@ -117,11 +117,19 @@ impl<TCloseable: Closeable> IntoFuture for CloseBuilder<TCloseable> {
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(
             async move {
-                if tokio::time::timeout(self.timeout, self.closee.close_inner(self.close_args))
-                    .await
-                    .is_err()
+                #[cfg(not(target_arch = "wasm32"))]
                 {
-                    bail!("close operation timed out!")
+                    if tokio::time::timeout(self.timeout, self.closee.close_inner(self.close_args))
+                        .await
+                        .is_err()
+                    {
+                        bail!("close operation timed out!")
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    // On WASM, tokio::time is not available; just run without timeout
+                    self.closee.close_inner(self.close_args).await;
                 }
                 Ok(())
             }
