@@ -7,6 +7,8 @@ enabling a browser-based zenoh client that can connect to a zenoh router.
 ## Status
 
 ### Building for WASM (wasm32-unknown-unknown)
+
+#### Commons (all done)
 - [x] zenoh-result
 - [x] zenoh-collections (needed getrandom 0.3 wasm_js feature)
 - [x] zenoh-buffers
@@ -16,24 +18,43 @@ enabling a browser-based zenoh client that can connect to a zenoh router.
 - [x] zenoh-crypto
 - [x] zenoh-runtime (split into native.rs/wasm.rs, wasm uses spawn_local)
 - [x] zenoh-core
-- [ ] zenoh-sync — `event_listener::wait()` is blocking, doesn't exist on WASM
-- [ ] zenoh-task — uses `tokio::task::JoinHandle`, `tokio_util::CancellationToken`, `tokio::select!`
-- [ ] zenoh-util — `home`, `shellexpand`, `libloading`, tokio net
-- [ ] zenoh-config — depends on zenoh-util
-- [ ] zenoh-link-commons — `socket2`, tokio net/fs
-- [ ] zenoh-link-ws — tokio-tungstenite → needs web-sys WebSocket for WASM
-- [ ] zenoh-transport — heavy tokio usage, feature-gated transports
+- [x] zenoh-sync (blocking wait methods gated out)
+- [x] zenoh-task (split into native/wasm, custom CancellationToken for wasm)
+- [x] zenoh-util (platform-specific modules gated out)
+- [x] zenoh-config (LibLoader gated out, LibSearchDirs kept with empty default)
+
+#### I/O Layer (next)
+- [ ] zenoh-link-commons — needs heavy refactoring:
+  - socket2, tokio net/fs are core dependencies
+  - Trait definitions (LinkUnicast, etc.) needed by transport layer
+  - Strategy: gate out socket-specific code, keep trait abstractions
+- [ ] zenoh-link-ws — the target transport for WASM
+  - Native: tokio-tungstenite (keep as-is)
+  - WASM: web-sys::WebSocket (new implementation)
+- [ ] zenoh-link (aggregator) — compile with only transport_ws on WASM
+- [ ] zenoh-transport — heavy tokio, needs selective gating
+
+#### Top Level
 - [ ] zenoh (main crate)
 
-### Approach
-- `cfg(target_arch = "wasm32")` gates — keep native code untouched
-- Re-export compatible types from zenoh-runtime (JoinHandle, etc.)
-- On WASM: single-threaded, wasm-bindgen-futures, flume channels
-- Only `transport_ws` needed for WASM target
-- Replace tokio-tungstenite with web-sys WebSocket on WASM
-
-### Key Decisions
-- ZRuntime on WASM: all variants map to the same single-threaded executor
+### Architecture Notes
+- ZRuntime on WASM: all variants map to single-threaded wasm-bindgen-futures executor
 - JoinHandle on WASM: flume channel-based, compatible Future impl
+- CancellationToken on WASM: AtomicBool-based (from zenoh-task wasm module)
 - block_in_place: panics on WASM (callers must be gated)
 - getrandom: v0.2 uses `js` feature, v0.3 uses `wasm_js` cfg + feature
+
+### Next Steps for I/O Layer
+The I/O layer is the hardest part. Two approaches:
+
+**Option A: Refactor zenoh-link-commons**
+Gate out socket2/tokio-net deps, keep trait definitions.
+Pro: minimal code duplication. Con: lots of cfg gates in existing code.
+
+**Option B: Thin WASM transport crate**
+Create a new `zenoh-link-ws-wasm` that implements link traits directly
+using web-sys WebSocket, bypassing zenoh-link-commons entirely.
+Pro: clean separation. Con: duplicates some trait definitions.
+
+Recommendation: Option A — the traits are stable and most impls are
+already feature-gated (quic, tls). Adding a wasm gate is consistent.
