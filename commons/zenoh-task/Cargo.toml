@@ -29,8 +29,13 @@ tracing-instrument = ["zenoh-runtime/tracing-instrument"]
 
 [dependencies]
 futures = { workspace = true }
-tokio = { workspace = true, features = ["default", "sync"] }
-tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 zenoh-core = { workspace = true }
 zenoh-runtime = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["default", "sync"] }
+tokio-util = { workspace = true, features = ["rt"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"

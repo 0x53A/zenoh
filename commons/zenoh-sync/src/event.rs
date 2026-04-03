@@ -17,10 +17,13 @@ use std::{
         atomic::{AtomicU16, AtomicU8, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
 };
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{Duration, Instant};
 
-use event_listener::{Event as EventLib, Listener};
+use event_listener::Event as EventLib;
+#[cfg(not(target_arch = "wasm32"))]
+use event_listener::Listener;
 
 // Error types
 const WAIT_ERR_STR: &str = "No notifier available";
@@ -238,7 +241,8 @@ impl Waiter {
         Ok(())
     }
 
-    /// Waits for the condition to be notified
+    /// Waits for the condition to be notified (blocking — not available on WASM)
+    #[cfg(not(target_arch = "wasm32"))]
     #[inline]
     pub fn wait(&self) -> Result<(), WaitError> {
         // Wait until the flag is set.
@@ -267,7 +271,8 @@ impl Waiter {
         Ok(())
     }
 
-    /// Waits for the condition to be notified or returns an error when the deadline is reached
+    /// Waits for the condition to be notified or returns an error when the deadline is reached (blocking — not available on WASM)
+    #[cfg(not(target_arch = "wasm32"))]
     #[inline]
     pub fn wait_deadline(&self, deadline: Instant) -> Result<(), WaitDeadlineError> {
         // Wait until the flag is set.
@@ -298,7 +303,8 @@ impl Waiter {
         Ok(())
     }
 
-    /// Waits for the condition to be notified or returns an error when the timeout is expired
+    /// Waits for the condition to be notified or returns an error when the timeout is expired (blocking — not available on WASM)
+    #[cfg(not(target_arch = "wasm32"))]
     #[inline]
     pub fn wait_timeout(&self, timeout: Duration) -> Result<(), WaitTimeoutError> {
         // Wait until the flag is set.

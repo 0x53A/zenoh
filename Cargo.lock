@@ -6704,6 +6704,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "wasm-bindgen-futures",
  "zenoh-core",
  "zenoh-runtime",
 ]
