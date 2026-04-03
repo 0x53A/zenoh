@@ -21,7 +21,7 @@ use std::{
 
 use arc_swap::ArcSwapOption;
 use itertools::Itertools;
-use tokio_util::sync::CancellationToken;
+use zenoh_task::CancellationToken;
 use zenoh_collections::IntHashMap;
 use zenoh_keyexpr::keyexpr;
 use zenoh_protocol::{

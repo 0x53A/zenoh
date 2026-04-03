@@ -11,8 +11,12 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use std::{fmt, net::SocketAddr, ops::Deref, time::Duration};
+use std::{fmt, ops::Deref, time::Duration};
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::net::SocketAddr;
+
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::net::UdpSocket;
 use zenoh_config::wrappers::Hello;
 use zenoh_protocol::core::WhatAmIMatcher;
@@ -145,6 +149,7 @@ impl<Receiver> Scout<Receiver> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn _scout(
     what: WhatAmIMatcher,
     config: Config,
@@ -200,6 +205,16 @@ pub(crate) fn _scout(
             });
         }
     }
+    Ok(ScoutInner { scout_task: None })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn _scout(
+    _what: WhatAmIMatcher,
+    _config: Config,
+    _callback: Callback<Hello>,
+) -> ZResult<ScoutInner> {
+    tracing::warn!("UDP scouting is not available on WASM");
     Ok(ScoutInner { scout_task: None })
 }
 
