@@ -22,8 +22,11 @@ use std::{
 };
 
 use futures::{future::select_all, task::AtomicWaker};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+#[cfg(target_arch = "wasm32")]
+use zenoh_runtime::JoinHandle;
+use zenoh_task::CancellationToken;
 use zenoh_link::Link;
 use zenoh_protocol::{
     core::Priority,
@@ -328,17 +331,25 @@ async fn write_loop(
     // Drain the transmission pipeline and write remaining bytes on the wire
     let mut batches = pipeline.drain();
     for (mut b, _) in batches.drain(..) {
-        tokio::time::timeout(
-            keep_alive_tracker.timeout(),
-            link.send_batch(&mut b, write_priority),
-        )
-        .await
-        .map_err(|_| {
-            zerror!(
-                "{link}: flush failed after {} ms",
-                keep_alive_tracker.timeout().as_millis()
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            tokio::time::timeout(
+                keep_alive_tracker.timeout(),
+                link.send_batch(&mut b, write_priority),
             )
-        })??;
+            .await
+            .map_err(|_| {
+                zerror!(
+                    "{link}: flush failed after {} ms",
+                    keep_alive_tracker.timeout().as_millis()
+                )
+            })??;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // On WASM, tokio::time::timeout is not available; send without timeout
+            link.send_batch(&mut b, write_priority).await?;
+        }
 
         #[cfg(feature = "stats")]
         {
@@ -456,13 +467,15 @@ struct TimeoutTrackerInner {
     waker: AtomicWaker,
     has_timed_out: AtomicBool,
     latest_reset: Mutex<Instant>,
-    task: OnceLock<JoinHandle<()>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    task: OnceLock<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Clone)]
 struct TimeoutTracker(Arc<TimeoutTrackerInner>);
 
 impl TimeoutTracker {
+    #[cfg(not(target_arch = "wasm32"))]
     fn new(timeout: Duration) -> TimeoutTracker {
         let now = Instant::now();
         let inner = Arc::new(TimeoutTrackerInner {
@@ -493,6 +506,19 @@ impl TimeoutTracker {
         Self(inner)
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn new(timeout: Duration) -> TimeoutTracker {
+        let now = Instant::now();
+        let inner = Arc::new(TimeoutTrackerInner {
+            timeout,
+            waker: AtomicWaker::new(),
+            has_timed_out: AtomicBool::new(false),
+            latest_reset: Mutex::new(now),
+        });
+        // On WASM, no background task for timeout tracking; timeouts will not fire
+        Self(inner)
+    }
+
     fn timeout(&self) -> Duration {
         self.0.timeout
     }
@@ -517,6 +543,7 @@ impl TimeoutTracker {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for TimeoutTracker {
     fn drop(&mut self) {
         self.0.task.get().unwrap().abort();

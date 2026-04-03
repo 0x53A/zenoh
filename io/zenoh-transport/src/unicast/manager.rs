@@ -495,10 +495,18 @@ impl TransportManager {
         link: Link,
     ) -> ZResult<()> {
         if let Some(callback) = transport.get_callback() {
-            tokio::task::spawn_blocking(move || {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                tokio::task::spawn_blocking(move || {
+                    callback.new_link(link);
+                })
+                .await?;
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                // On WASM, spawn_blocking is not available; call directly
                 callback.new_link(link);
-            })
-            .await?;
+            }
         }
 
         Ok(())
@@ -805,14 +813,25 @@ impl TransportManager {
         };
 
         // Open the link
-        tokio::time::timeout(self.config.unicast.open_timeout, async {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            tokio::time::timeout(self.config.unicast.open_timeout, async {
+                match manager.new_link(endpoint.clone()).await {
+                    Ok(link) => super::establishment::open::open_link(endpoint, link, self).await,
+                    Err(e) => Err(e),
+                }
+            })
+            .await
+            .map_err(|e| zerror!("{e}"))?
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // On WASM, tokio::time::timeout is not available; run without timeout
             match manager.new_link(endpoint.clone()).await {
                 Ok(link) => super::establishment::open::open_link(endpoint, link, self).await,
                 Err(e) => Err(e),
             }
-        })
-        .await
-        .map_err(|e| zerror!("{e}"))?
+        }
     }
 
     pub async fn get_transport_unicast(&self, peer: &ZenohIdProto) -> Option<TransportUnicast> {
@@ -870,17 +889,25 @@ impl TransportManager {
         let c_manager = self.clone();
         self.task_controller
             .spawn_with_rt(zenoh_runtime::ZRuntime::Acceptor, async move {
-                if tokio::time::timeout(
-                    c_manager.config.unicast.accept_timeout,
-                    super::establishment::accept::accept_link(link, &c_manager),
-                )
-                .await
-                .is_err()
+                #[cfg(not(target_arch = "wasm32"))]
                 {
-                    tracing::debug!(
-                        "Failed to accept link before deadline ({}ms)",
-                        c_manager.config.unicast.accept_timeout.as_millis()
-                    );
+                    if tokio::time::timeout(
+                        c_manager.config.unicast.accept_timeout,
+                        super::establishment::accept::accept_link(link, &c_manager),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::debug!(
+                            "Failed to accept link before deadline ({}ms)",
+                            c_manager.config.unicast.accept_timeout.as_millis()
+                        );
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    // On WASM, tokio::time::timeout is not available; accept without timeout
+                    let _ = super::establishment::accept::accept_link(link, &c_manager).await;
                 }
                 incoming_counter.fetch_sub(1, SeqCst);
             });

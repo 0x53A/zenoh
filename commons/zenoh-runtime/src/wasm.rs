@@ -58,6 +58,12 @@ pub struct JoinHandle<T> {
     rx: flume::Receiver<T>,
 }
 
+impl<T> std::fmt::Debug for JoinHandle<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinHandle").finish()
+    }
+}
+
 impl<T> Future for JoinHandle<T> {
     type Output = Result<T, JoinError>;
 

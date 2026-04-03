@@ -41,7 +41,9 @@ use zenoh_protocol::{
         AtomicBatchSize, BatchSize, TransportMessage,
     },
 };
-use zenoh_sync::{event, Notifier, WaitDeadlineError, Waiter};
+#[cfg(not(target_arch = "wasm32"))]
+use zenoh_sync::WaitDeadlineError;
+use zenoh_sync::{event, Notifier, Waiter};
 
 use super::{
     batch::{Encode, WBatch},
@@ -84,16 +86,30 @@ impl StageInRefill {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn wait(&self) -> bool {
         self.n_ref_r.wait().is_ok()
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn wait(&self) -> bool {
+        // On WASM, blocking wait is not available; just return false to skip waiting
+        false
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn wait_deadline(&self, instant: Instant) -> Result<bool, TransportClosed> {
         match self.n_ref_r.wait_deadline(instant) {
             Ok(()) => Ok(true),
             Err(WaitDeadlineError::Deadline) => Ok(false),
             Err(WaitDeadlineError::WaitError) => Err(TransportClosed),
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn wait_deadline(&self, _instant: Instant) -> Result<bool, TransportClosed> {
+        // On WASM, blocking wait_deadline is not available; return as if deadline expired
+        Ok(false)
     }
 }
 
@@ -975,9 +991,25 @@ pub(crate) trait PipelineConsumer {
             // While trying to pull from the queue, the stage_in `lock()` will most likely taken, leading to
             // a spinning behaviour while attempting to take the lock. Yield the current task to avoid
             // spinning the current task indefinitely.
+            #[cfg(not(target_arch = "wasm32"))]
             tokio::task::yield_now().await;
+            #[cfg(target_arch = "wasm32")]
+            {
+                // yield_now equivalent for WASM
+                let mut yielded = false;
+                std::future::poll_fn(|cx| {
+                    if yielded {
+                        std::task::Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                }).await;
+            }
 
             // Wait for the backoff to expire or for a new message
+            #[cfg(not(target_arch = "wasm32"))]
             let backoff_wait = match backoff {
                 Some(b) => {
                     tokio::time::timeout(
@@ -987,6 +1019,12 @@ pub(crate) trait PipelineConsumer {
                     .await
                 }
                 None => Ok(self.n_out_r().wait_async().await),
+            };
+            #[cfg(target_arch = "wasm32")]
+            let backoff_wait: Result<Result<(), zenoh_sync::WaitError>, ()> = {
+                // On WASM, tokio::time is not available; just await the notification directly
+                let _ = backoff;
+                Ok(self.n_out_r().wait_async().await)
             };
             match backoff_wait {
                 Ok(Ok(())) => {

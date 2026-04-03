@@ -95,8 +95,14 @@ pub(crate) async fn read_with_link(
 }
 
 impl TransportUnicastLowlatency {
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn send(&self, msg: TransportMessageLowLatencyRef) -> ZResult<()> {
         zenoh_runtime::ZRuntime::TX.block_in_place(self.send_async(msg))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(super) fn send(&self, _msg: TransportMessageLowLatencyRef) -> ZResult<()> {
+        panic!("Synchronous send() is not supported on WASM (requires block_in_place)")
     }
 
     pub(super) async fn send_async(&self, msg: TransportMessageLowLatencyRef<'_>) -> ZResult<()> {
@@ -141,7 +147,10 @@ impl TransportUnicastLowlatency {
                 zenoh_runtime::ZRuntime::RX.spawn(async move { c_transport.finalize(0).await });
             }
         };
+        #[cfg(not(target_arch = "wasm32"))]
         self.tracker.spawn_on(task, &ZRuntime::TX);
+        #[cfg(target_arch = "wasm32")]
+        self.tracker.spawn(task);
     }
 
     pub(super) fn internal_start_rx(&self, lease: Duration) {
@@ -173,58 +182,85 @@ impl TransportUnicastLowlatency {
                 // Retrieve one buffer
                 let mut buffer = pool.try_take().unwrap_or_else(|| pool.alloc());
 
-                tokio::select! {
-                    // Async read from the underlying link
-                    res = tokio::time::timeout(lease, read_with_link(&link_rx, &mut buffer, is_streamed)) => {
-                        let bytes = res.map_err(|_| zerror!("{}: expired after {} milliseconds", link_rx, lease.as_millis()))??;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    tokio::select! {
+                        // Async read from the underlying link
+                        res = tokio::time::timeout(lease, read_with_link(&link_rx, &mut buffer, is_streamed)) => {
+                            let bytes = res.map_err(|_| zerror!("{}: expired after {} milliseconds", link_rx, lease.as_millis()))??;
 
-                        #[cfg(feature = "stats")] {
-                            let header_bytes = if is_streamed { 2 } else { 0 };
-                            stats.inc_bytes(zenoh_stats::Tx, header_bytes + bytes as u64)
+                            #[cfg(feature = "stats")] {
+                                let header_bytes = if is_streamed { 2 } else { 0 };
+                                stats.inc_bytes(zenoh_stats::Tx, header_bytes + bytes as u64)
+                            }
+
+                            // Deserialize all the messages from the current ZBuf
+                            let zslice = ZSlice::new(Arc::new(buffer), 0, bytes).unwrap();
+                            c_transport.read_messages(zslice, &link_rx.link, #[cfg(feature = "stats")] stats).await?;
                         }
 
-                        // Deserialize all the messages from the current ZBuf
-                        let zslice = ZSlice::new(Arc::new(buffer), 0, bytes).unwrap();
-                        c_transport.read_messages(zslice, &link_rx.link, #[cfg(feature = "stats")] stats).await?;
+                        _ = token.cancelled() => {
+                            break ZResult::Ok(());
+                        }
                     }
+                }
 
-                    _ = token.cancelled() => {
-                        break ZResult::Ok(());
+                #[cfg(target_arch = "wasm32")]
+                {
+                    // On WASM, tokio::time is not available; read without timeout but still check cancellation
+                    tokio::select! {
+                        res = read_with_link(&link_rx, &mut buffer, is_streamed) => {
+                            let bytes = res?;
+
+                            #[cfg(feature = "stats")] {
+                                let header_bytes = if is_streamed { 2 } else { 0 };
+                                stats.inc_bytes(zenoh_stats::Tx, header_bytes + bytes as u64)
+                            }
+
+                            let zslice = ZSlice::new(Arc::new(buffer), 0, bytes).unwrap();
+                            c_transport.read_messages(zslice, &link_rx.link, #[cfg(feature = "stats")] stats).await?;
+                        }
+
+                        _ = token.cancelled() => {
+                            break ZResult::Ok(());
+                        }
                     }
                 }
             }
         };
 
         let c_transport = self.clone();
-        self.tracker.spawn_on(
-            async move {
-                let res = rx_task.await;
+        let rx_wrapper = async move {
+            let res = rx_task.await;
+            tracing::debug!(
+                "[{}] Rx task finished with result {:?}",
+                c_transport.manager.config.zid,
+                res
+            );
+            if res.is_err() {
                 tracing::debug!(
-                    "[{}] Rx task finished with result {:?}",
+                    "[{}] <on rx exit> finalizing transport with peer: {}",
                     c_transport.manager.config.zid,
-                    res
+                    c_transport.config.zid
                 );
-                if res.is_err() {
-                    tracing::debug!(
-                        "[{}] <on rx exit> finalizing transport with peer: {}",
-                        c_transport.manager.config.zid,
-                        c_transport.config.zid
-                    );
 
-                    // Spawn a task to avoid a deadlock waiting for this same task
-                    // to finish in the close() joining its handle
-                    // WARN: Must be spawned on RX
-                    zenoh_runtime::ZRuntime::RX.spawn(async move { c_transport.finalize(0).await });
-                }
-            },
-            &ZRuntime::RX,
-        );
+                // Spawn a task to avoid a deadlock waiting for this same task
+                // to finish in the close() joining its handle
+                // WARN: Must be spawned on RX
+                zenoh_runtime::ZRuntime::RX.spawn(async move { c_transport.finalize(0).await });
+            }
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        self.tracker.spawn_on(rx_wrapper, &ZRuntime::RX);
+        #[cfg(target_arch = "wasm32")]
+        self.tracker.spawn(rx_wrapper);
     }
 }
 
 /*************************************/
 /*              TASKS                */
 /*************************************/
+#[cfg(not(target_arch = "wasm32"))]
 async fn keepalive_task(
     link: Arc<RwLock<Option<TransportLinkUnicast>>>,
     keep_alive: Duration,
@@ -256,5 +292,17 @@ async fn keepalive_task(
             _ = token.cancelled() => break,
         }
     }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn keepalive_task(
+    _link: Arc<RwLock<Option<TransportLinkUnicast>>>,
+    _keep_alive: Duration,
+    token: CancellationToken,
+    #[cfg(feature = "stats")] _stats: Arc<OnceLock<zenoh_stats::LinkStats>>,
+) -> ZResult<()> {
+    // On WASM, tokio::time is not available; just wait for cancellation
+    token.cancelled().await;
     Ok(())
 }

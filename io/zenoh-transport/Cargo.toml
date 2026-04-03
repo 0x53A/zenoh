@@ -81,6 +81,14 @@ zenoh-sync = { workspace = true }
 zenoh-task = { workspace = true }
 zenoh-util = { workspace = true }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { workspace = true, features = [
+  "macros",
+  "sync",
+] }
+tokio-util = { workspace = true, features = ["rt"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = [
   "fs",

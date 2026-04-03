@@ -186,6 +186,7 @@ impl TransportUnicastTrait for TransportUnicastLowlatency {
         zasynclock!(self.status)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn get_links(&self) -> Vec<Link> {
         let handle = tokio::runtime::Handle::current();
         let guard =
@@ -193,10 +194,18 @@ impl TransportUnicastTrait for TransportUnicastLowlatency {
         guard.as_ref().map(|l| vec![l.link()]).unwrap_or_default()
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn get_links(&self) -> Vec<Link> {
+        // On WASM, block_in_place is not available.
+        // This is a synchronous method that cannot be made async without trait changes.
+        panic!("get_links() is not supported on WASM (requires block_in_place)")
+    }
+
     fn get_zid(&self) -> ZenohIdProto {
         self.config.zid
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn get_auth_ids(&self) -> TransportAuthId {
         // Convert LinkUnicast auth id to AuthId
         let mut transport_auth_id = TransportAuthId::new(self.get_zid());
@@ -210,6 +219,12 @@ impl TransportUnicastTrait for TransportUnicastLowlatency {
         #[cfg(feature = "auth_usrpwd")]
         transport_auth_id.set_username(&self.config.auth_id);
         transport_auth_id
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn get_auth_ids(&self) -> TransportAuthId {
+        // On WASM, block_in_place is not available.
+        panic!("get_auth_ids() is not supported on WASM (requires block_in_place)")
     }
 
     fn get_whatami(&self) -> WhatAmI {

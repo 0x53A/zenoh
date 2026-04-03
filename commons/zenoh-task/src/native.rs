@@ -16,7 +16,8 @@ use std::{future::Future, time::Duration};
 
 use futures::future::FutureExt;
 use tokio::task::JoinHandle;
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+pub use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use zenoh_core::{ResolveFuture, Wait};
 use zenoh_runtime::ZRuntime;
 

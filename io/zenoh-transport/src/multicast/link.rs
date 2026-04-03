@@ -18,7 +18,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::task::JoinHandle;
+#[cfg(target_arch = "wasm32")]
+use zenoh_runtime::JoinHandle;
 use zenoh_buffers::{BBuf, ZSlice, ZSliceBuffer};
 use zenoh_core::{zcondfeat, zlock};
 use zenoh_link::{LinkMulticast, Locator};
@@ -418,6 +421,7 @@ async fn tx_task(
     mut last_sns: Vec<PrioritySn>,
     #[cfg(feature = "stats")] stats: zenoh_stats::LinkStats,
 ) -> ZResult<()> {
+    #[cfg(not(target_arch = "wasm32"))]
     async fn join(last_join: Instant, join_interval: Duration) {
         let now = Instant::now();
         let target = last_join + join_interval;
@@ -429,93 +433,134 @@ async fn tx_task(
 
     let mut last_join = Instant::now().checked_sub(config.join_interval).unwrap();
     loop {
-        tokio::select! {
-            res = pipeline.pull() => {
-                match res {
-                    Some((mut batch, priority)) => {
-                        // Send the buffer on the link
-                        link.send_batch(&mut batch).await?;
-                        // Keep track of next SNs
-                        if let Some(sn) = batch.codec.latest_sn.reliable {
-                            last_sns[priority as usize].reliable = sn;
-                        }
-                        if let Some(sn) = batch.codec.latest_sn.best_effort {
-                            last_sns[priority as usize].best_effort = sn;
-                        }
-                        #[cfg(feature = "stats")]
-                        {
-                            stats.inc_bytes(zenoh_stats::Tx,  batch.len() as u64);
-                            stats.inc_transport_message(zenoh_stats::Tx, batch.stats.t_msgs as u64);
-                        }
-                        // Reinsert the batch into the queue
-                        pipeline.refill(batch, priority);
-                    }
-                    None => {
-                        // Drain the transmission pipeline and write remaining bytes on the wire
-                        let mut batches = pipeline.drain();
-                        for (mut b, _) in batches.drain(..) {
-                            tokio::time::timeout(config.join_interval, link.send_batch(&mut b))
-                                .await
-                                .map_err(|_| {
-                                    zerror!(
-                                        "{}: flush failed after {} ms",
-                                        link,
-                                        config.join_interval.as_millis()
-                                    )
-                                })??;
-
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            tokio::select! {
+                res = pipeline.pull() => {
+                    match res {
+                        Some((mut batch, priority)) => {
+                            // Send the buffer on the link
+                            link.send_batch(&mut batch).await?;
+                            // Keep track of next SNs
+                            if let Some(sn) = batch.codec.latest_sn.reliable {
+                                last_sns[priority as usize].reliable = sn;
+                            }
+                            if let Some(sn) = batch.codec.latest_sn.best_effort {
+                                last_sns[priority as usize].best_effort = sn;
+                            }
                             #[cfg(feature = "stats")]
                             {
-                                stats.inc_bytes(zenoh_stats::Tx,  b.len() as u64);
-                                stats.inc_transport_message(zenoh_stats::Tx,  b.stats.t_msgs as u64);
+                                stats.inc_bytes(zenoh_stats::Tx,  batch.len() as u64);
+                                stats.inc_transport_message(zenoh_stats::Tx, batch.stats.t_msgs as u64);
                             }
+                            // Reinsert the batch into the queue
+                            pipeline.refill(batch, priority);
                         }
-                        break;
+                        None => {
+                            // Drain the transmission pipeline and write remaining bytes on the wire
+                            let mut batches = pipeline.drain();
+                            for (mut b, _) in batches.drain(..) {
+                                tokio::time::timeout(config.join_interval, link.send_batch(&mut b))
+                                    .await
+                                    .map_err(|_| {
+                                        zerror!(
+                                            "{}: flush failed after {} ms",
+                                            link,
+                                            config.join_interval.as_millis()
+                                        )
+                                    })??;
+
+                                #[cfg(feature = "stats")]
+                                {
+                                    stats.inc_bytes(zenoh_stats::Tx,  b.len() as u64);
+                                    stats.inc_transport_message(zenoh_stats::Tx,  b.stats.t_msgs as u64);
+                                }
+                            }
+                            break;
+                        }
+
+                    }
+                }
+
+                _ = join(last_join, config.join_interval) => {
+                    let next_sns = last_sns
+                        .iter()
+                        .map(|c| PrioritySn {
+                            reliable: (1 + c.reliable) & config.sn_resolution.mask() as TransportSn,
+                            best_effort: (1 + c.best_effort)
+                                & config.sn_resolution.mask() as TransportSn,
+                        })
+                        .collect::<Vec<PrioritySn>>();
+                    let (next_sn, ext_qos) = if next_sns.len() == Priority::NUM {
+                        let tmp: [PrioritySn; Priority::NUM] = next_sns.try_into().unwrap();
+                        (PrioritySn::DEFAULT, Some(Box::new(tmp)))
+                    } else {
+                        (next_sns[0], None)
+                    };
+                    let message: TransportMessage = Join {
+                        version: config.version,
+                        whatami: config.whatami,
+                        zid: config.zid,
+                        resolution: Resolution::default(),
+                        batch_size: config.batch_size,
+                        lease: config.lease,
+                        next_sn,
+                        ext_qos,
+                        ext_shm: None,
+                        ext_patch: PatchType::CURRENT
+                    }
+                    .into();
+
+                    #[allow(unused_variables)] // Used when stats feature is enabled
+                    let n = link.send(&message).await?;
+                    #[cfg(feature = "stats")]
+                    {
+                        stats.inc_bytes(zenoh_stats::Tx, n as u64);
+                        stats.inc_transport_message(zenoh_stats::Tx,  1);
                     }
 
+                    last_join = Instant::now();
+
                 }
             }
+        }
 
-            _ = join(last_join, config.join_interval) => {
-                let next_sns = last_sns
-                    .iter()
-                    .map(|c| PrioritySn {
-                        reliable: (1 + c.reliable) & config.sn_resolution.mask() as TransportSn,
-                        best_effort: (1 + c.best_effort)
-                            & config.sn_resolution.mask() as TransportSn,
-                    })
-                    .collect::<Vec<PrioritySn>>();
-                let (next_sn, ext_qos) = if next_sns.len() == Priority::NUM {
-                    let tmp: [PrioritySn; Priority::NUM] = next_sns.try_into().unwrap();
-                    (PrioritySn::DEFAULT, Some(Box::new(tmp)))
-                } else {
-                    (next_sns[0], None)
-                };
-                let message: TransportMessage = Join {
-                    version: config.version,
-                    whatami: config.whatami,
-                    zid: config.zid,
-                    resolution: Resolution::default(),
-                    batch_size: config.batch_size,
-                    lease: config.lease,
-                    next_sn,
-                    ext_qos,
-                    ext_shm: None,
-                    ext_patch: PatchType::CURRENT
+        #[cfg(target_arch = "wasm32")]
+        {
+            // On WASM, tokio::time is not available, so no sleep/timeout for join intervals.
+            // Just pull from the pipeline without join/timeout support.
+            match pipeline.pull().await {
+                Some((mut batch, priority)) => {
+                    link.send_batch(&mut batch).await?;
+                    if let Some(sn) = batch.codec.latest_sn.reliable {
+                        last_sns[priority as usize].reliable = sn;
+                    }
+                    if let Some(sn) = batch.codec.latest_sn.best_effort {
+                        last_sns[priority as usize].best_effort = sn;
+                    }
+                    #[cfg(feature = "stats")]
+                    {
+                        stats.inc_bytes(zenoh_stats::Tx, batch.len() as u64);
+                        stats.inc_transport_message(zenoh_stats::Tx, batch.stats.t_msgs as u64);
+                    }
+                    pipeline.refill(batch, priority);
                 }
-                .into();
-
-                #[allow(unused_variables)] // Used when stats feature is enabled
-                let n = link.send(&message).await?;
-                #[cfg(feature = "stats")]
-                {
-                    stats.inc_bytes(zenoh_stats::Tx, n as u64);
-                    stats.inc_transport_message(zenoh_stats::Tx,  1);
+                None => {
+                    let mut batches = pipeline.drain();
+                    for (mut b, _) in batches.drain(..) {
+                        link.send_batch(&mut b).await.map_err(|e| {
+                            zerror!("{}: flush failed: {}", link, e)
+                        })?;
+                        #[cfg(feature = "stats")]
+                        {
+                            stats.inc_bytes(zenoh_stats::Tx, b.len() as u64);
+                            stats.inc_transport_message(zenoh_stats::Tx, b.stats.t_msgs as u64);
+                        }
+                    }
+                    break;
                 }
-
-                last_join = Instant::now();
-
             }
+            let _ = last_join;
         }
     }
 
