@@ -11,7 +11,9 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use std::{env, error::Error, fmt::Display, path::PathBuf, str::FromStr};
+use std::{error::Error, fmt::Display};
+#[cfg(not(target_arch = "wasm32"))]
+use std::{env, path::PathBuf, str::FromStr};
 
 use serde::{
     de::{value::MapAccessDeserializer, Visitor},
@@ -64,10 +66,12 @@ impl Display for InvalidLibSearchDir {
 impl Error for InvalidLibSearchDir {}
 
 #[derive(Debug)]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct IntoIter {
     iter: std::vec::IntoIter<LibSearchDir>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Iterator for IntoIter {
     type Item = Result<PathBuf, InvalidLibSearchDir>;
 
@@ -76,6 +80,7 @@ impl Iterator for IntoIter {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl IntoIterator for LibSearchDirs {
     type Item = Result<PathBuf, InvalidLibSearchDir>;
 
@@ -88,6 +93,7 @@ impl IntoIterator for LibSearchDirs {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Default for LibSearchDirs {
     fn default() -> Self {
         LibSearchDirs(vec![
@@ -104,12 +110,20 @@ impl Default for LibSearchDirs {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+impl Default for LibSearchDirs {
+    fn default() -> Self {
+        LibSearchDirs(vec![])
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum LibSearchDir {
     Path(String),
     Spec(LibSearchSpec),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl LibSearchDir {
     fn into_path(self) -> Result<PathBuf, InvalidLibSearchDir> {
         match self {
@@ -130,6 +144,7 @@ pub struct LibSearchSpec {
     value: Option<String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl LibSearchSpec {
     fn into_path(self) -> Result<PathBuf, InvalidLibSearchDir> {
         fn error_from_source<T: Error>(spec: &LibSearchSpec, err: T) -> InvalidLibSearchDir {
