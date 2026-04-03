@@ -17,6 +17,7 @@ use core::{
     hash::{Hash, Hasher},
     ops::Deref,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use std::net::SocketAddr;
 
 use async_trait::async_trait;
@@ -112,6 +113,7 @@ impl From<Arc<dyn LinkUnicastTrait>> for LinkUnicast {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn get_ip_interface_names(addr: &SocketAddr) -> Vec<String> {
     match zenoh_util::net::get_interface_names_by_addr(addr.ip()) {
         Ok(interfaces) => {

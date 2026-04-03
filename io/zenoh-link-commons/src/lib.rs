@@ -19,11 +19,14 @@
 //! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
 extern crate alloc;
 
+#[cfg(not(target_arch = "wasm32"))]
 mod dscp;
+#[cfg(not(target_arch = "wasm32"))]
 mod listener;
 mod multicast;
 #[cfg(feature = "quic")]
 pub mod quic;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod tcp;
 #[cfg(feature = "tls")]
 pub mod tls;
@@ -33,7 +36,9 @@ use alloc::{borrow::ToOwned, boxed::Box, string::String, vec, vec::Vec};
 use core::{cmp::PartialEq, fmt, hash::Hash};
 
 use async_trait::async_trait;
+#[cfg(not(target_arch = "wasm32"))]
 pub use dscp::*;
+#[cfg(not(target_arch = "wasm32"))]
 pub use listener::*;
 pub use multicast::*;
 use serde::Serialize;

@@ -64,16 +64,6 @@ ringbuffer-spsc = { workspace = true }
 rsa = { workspace = true, optional = true }
 serde = { workspace = true, features = ["default"] }
 sha3 = { workspace = true }
-tokio = { workspace = true, features = [
-  "fs",
-  "io-util",
-  "macros",
-  "net",
-  "rt-multi-thread",
-  "sync",
-  "time",
-] }
-tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 zenoh-buffers = { workspace = true }
 zenoh-codec = { workspace = true }
@@ -90,6 +80,18 @@ zenoh-stats = { workspace = true, optional = true }
 zenoh-sync = { workspace = true }
 zenoh-task = { workspace = true }
 zenoh-util = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = [
+  "fs",
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 zenoh-protocol = { workspace = true, features = ["test"] }
