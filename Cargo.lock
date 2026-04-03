@@ -5570,6 +5570,7 @@ name = "zenoh-runtime"
 version = "1.9.0"
 dependencies = [
  "flume",
+ "futures",
  "lazy_static",
  "ron",
  "serde",
@@ -5670,6 +5671,7 @@ dependencies = [
  "crossbeam-utils",
  "flume",
  "futures",
+ "gloo-timers",
  "lazy_static",
  "lz4_flex",
  "rand 0.8.5",

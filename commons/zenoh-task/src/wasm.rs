@@ -58,7 +58,7 @@ impl CancellationToken {
         }
     }
 
-    /// Runs a future until this token is cancelled.
+    /// Runs a future until this token is cancelled (owned version).
     pub fn run_until_cancelled_owned<F: Future>(
         &self,
         future: F,
@@ -74,6 +74,15 @@ impl CancellationToken {
             }
             Some(future.await)
         }
+    }
+
+    /// Runs a future until this token is cancelled (reference version).
+    /// API-compatible with tokio_util's CancellationToken::run_until_cancelled.
+    pub async fn run_until_cancelled<F: Future>(&self, future: F) -> Option<F::Output> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(future.await)
     }
 }
 

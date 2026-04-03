@@ -21,7 +21,7 @@ use std::{
     time::Duration,
 };
 
-use tokio_util::sync::CancellationToken;
+use zenoh_task::CancellationToken;
 use zenoh_core::{zcondfeat, zread, zwrite};
 use zenoh_link::{Link, Locator};
 use zenoh_protocol::{
@@ -391,6 +391,7 @@ impl TransportMulticastInner {
         let c_token = token.clone();
         let c_self = self.clone();
         let c_locator = locator.clone();
+        #[cfg(not(target_arch = "wasm32"))]
         let task = async move {
             let mut interval =
                 tokio::time::interval_at(tokio::time::Instant::now() + join.lease, join.lease);
@@ -405,6 +406,13 @@ impl TransportMulticastInner {
                 }
             }
             let _ = c_self.del_peer(&c_locator, close::reason::EXPIRED);
+        };
+        #[cfg(target_arch = "wasm32")]
+        let task = async move {
+            // On WASM, tokio::time is not available; just wait for cancellation
+            c_token.cancelled().await;
+            let _ = c_self.del_peer(&c_locator, close::reason::EXPIRED);
+            let _ = c_is_active;
         };
 
         self.task_controller
