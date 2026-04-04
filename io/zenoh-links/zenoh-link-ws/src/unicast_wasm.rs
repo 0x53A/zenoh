@@ -30,9 +30,11 @@ use zenoh_result::{bail, zerror, ZResult};
 
 use super::{WS_DEFAULT_MTU, WS_LOCATOR_PREFIX};
 
-/// Wrapper to make JsValue-based types Send+Sync on WASM (single-threaded).
+/// Wrapper to make JsValue-based types Send+Sync on WASM.
+/// SAFETY: With shared-memory workers, the wrapped JS object is thread-affine —
+/// only accessed from the worker that created it. The write_tx channel ensures
+/// write requests are proxied to the correct worker.
 struct SendWrapper<T>(T);
-// SAFETY: wasm32 is single-threaded
 unsafe impl<T> Send for SendWrapper<T> {}
 unsafe impl<T> Sync for SendWrapper<T> {}
 
@@ -43,8 +45,16 @@ impl<T> std::ops::Deref for SendWrapper<T> {
     }
 }
 
+/// Write request sent through the channel to the WebSocket-owning worker.
+enum WriteCmd {
+    Send(Vec<u8>),
+    Close,
+}
+
 pub struct LinkUnicastWs {
-    ws: SendWrapper<WebSocket>,
+    /// Channel for sending write requests to the worker that owns the WebSocket.
+    /// The worker runs a spawn_local loop that dequeues and calls ws.send().
+    write_tx: flume::Sender<WriteCmd>,
     recv_rx: flume::Receiver<Vec<u8>>,
     src_locator: Locator,
     dst_locator: Locator,
@@ -59,7 +69,7 @@ pub struct LinkUnicastWs {
 /// All !Send types are already wrapped in SendWrapper.
 /// Closures are stored and returned so they can be dropped when the link closes.
 struct WsSetup {
-    ws: SendWrapper<WebSocket>,
+    write_tx: flume::Sender<WriteCmd>,
     recv_rx: flume::Receiver<Vec<u8>>,
     open_rx: flume::Receiver<Result<(), String>>,
     msg_closures: SendWrapper<Vec<Closure<dyn FnMut(MessageEvent)>>>,
@@ -109,8 +119,31 @@ fn setup_ws(url: &str) -> ZResult<WsSetup> {
     // on_open is a one-shot — forget it since it's cleared after connection opens
     on_open.forget();
 
+    // Channel-based write path: write requests are sent through write_tx and
+    // dequeued by a spawn_local loop on this worker (which owns the WebSocket).
+    // This ensures ws.send() is always called from the creating worker's JS context,
+    // which is required for thread safety with SharedArrayBuffer workers.
+    let (write_tx, write_rx) = flume::unbounded::<WriteCmd>();
+    let ws_for_write = SendWrapper(ws.clone());
+    wasm_bindgen_futures::spawn_local(async move {
+        while let Ok(cmd) = write_rx.recv_async().await {
+            match cmd {
+                WriteCmd::Send(data) => {
+                    let _ = ws_for_write.send_with_u8_array(&data);
+                }
+                WriteCmd::Close => {
+                    ws_for_write.set_onmessage(None);
+                    ws_for_write.set_onerror(None);
+                    ws_for_write.set_onclose(None);
+                    let _ = ws_for_write.close();
+                    break;
+                }
+            }
+        }
+    });
+
     Ok(WsSetup {
-        ws: SendWrapper(ws),
+        write_tx,
         recv_rx,
         open_rx,
         msg_closures: SendWrapper(vec![on_message]),
@@ -131,15 +164,12 @@ impl LinkUnicastWs {
             Err(_) => bail!("WebSocket open channel closed unexpectedly"),
         }
 
-        // Clear onopen handler (one-shot)
-        setup.ws.set_onopen(None);
-
         let src_locator =
             Locator::new(WS_LOCATOR_PREFIX, "wasm-client", "").unwrap();
         let dst_locator = Locator::new(WS_LOCATOR_PREFIX, url, "").unwrap();
 
         Ok(Self {
-            ws: setup.ws,
+            write_tx: setup.write_tx,
             recv_rx: setup.recv_rx,
             src_locator,
             dst_locator,
@@ -154,19 +184,18 @@ impl LinkUnicastWs {
 impl LinkUnicastTrait for LinkUnicastWs {
     async fn close(&self) -> ZResult<()> {
         tracing::trace!("Closing WebSocket link: {}", self);
-        // Clear JS handlers before closing to prevent "closure dropped" errors
-        self.ws.set_onmessage(None);
-        self.ws.set_onerror(None);
-        self.ws.set_onclose(None);
-        self.ws.close().map_err(|e| {
-            zerror!("Failed to close WebSocket link {}: {:?}", self, e).into()
-        })
+        // Send close command through the write channel — the write loop on the
+        // owning worker will clear handlers and close the WebSocket.
+        let _ = self.write_tx.send(WriteCmd::Close);
+        Ok(())
     }
 
     async fn write(&self, buffer: &[u8], _priority: Option<Priority>) -> ZResult<usize> {
-        self.ws
-            .send_with_u8_array(buffer)
-            .map_err(|e| zerror!("Write error on WebSocket link {}: {:?}", self, e))?;
+        // Send through the channel — the write loop on the WebSocket-owning
+        // worker will call ws.send_with_u8_array() from the correct JS context.
+        self.write_tx
+            .send(WriteCmd::Send(buffer.to_vec()))
+            .map_err(|e| zerror!("Write error on WebSocket link {}: {}", self, e))?;
         Ok(buffer.len())
     }
 
@@ -270,7 +299,8 @@ pub struct LinkManagerUnicastWs {
     _manager: NewLinkChannelSender,
 }
 
-// SAFETY: Single-threaded WASM context
+// SAFETY: LinkManagerUnicastWs only holds a channel sender (Send-safe).
+// The actual JS objects are accessed only from the creating worker.
 unsafe impl Send for LinkManagerUnicastWs {}
 unsafe impl Sync for LinkManagerUnicastWs {}
 

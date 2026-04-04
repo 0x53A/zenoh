@@ -85,3 +85,5 @@ cargo build -p zenoh
 18. Instant audit, CancellationToken waker fix, reconnection support
 19. Worker protocol: binary payloads, query/get/queryable support
 20. Unused import cleanup across WASM-compiled crates
+21. SharedArrayBuffer threadpool infrastructure (wasm-threads feature)
+22. Channel-based WebSocket write for thread-safe I/O

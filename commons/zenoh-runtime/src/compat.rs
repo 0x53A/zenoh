@@ -27,7 +27,9 @@ pub use tokio::sync::{
 #[cfg(target_arch = "wasm32")]
 pub use futures::lock::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
-// futures doesn't have RwLock — on WASM single-threaded, use std's
-// (it will never actually block since there's only one thread)
+// futures doesn't have RwLock — on WASM, use std's.
+// With wasm-threads (SharedArrayBuffer), std::sync::RwLock uses real atomics.
+// This is safe because AsyncRwLock is only used in native-only link crates
+// (serial, vsock, unixsock, native ws) which don't compile on WASM.
 #[cfg(target_arch = "wasm32")]
 pub use std::sync::RwLock as AsyncRwLock;

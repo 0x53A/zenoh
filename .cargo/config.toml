@@ -5,8 +5,9 @@ rustflags = "-Ctarget-feature=-crt-static"
 rustflags = "-Ctarget-feature=-crt-static"
 
 [target.wasm32-unknown-unknown]
-rustflags = [
-  '--cfg', 'getrandom_backend="wasm_js"',
-  '-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals',
-]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+
+# For wasm-threads builds, use:
+# RUSTFLAGS='--cfg getrandom_backend="wasm_js" -Ctarget-feature=+atomics,+bulk-memory,+mutable-globals' \
+#   cargo build -Zbuild-std=std,panic_abort --target wasm32-unknown-unknown --features wasm-threads
 
