@@ -1,11 +1,11 @@
-// Worker bootstrap — loads the WASM module and starts the zenoh worker.
-import init, { start_worker } from './pkg/zenoh_wasm_client_example.js';
+// Worker bootstrap — loads the WASM module using importScripts (works in all browsers).
+importScripts('./pkg/zenoh_wasm_client_example.js');
 
 async function run() {
-    // Initialize the WASM module in the worker context
-    await init();
+    // wasm_bindgen is the global init function in no-modules mode
+    await wasm_bindgen('./pkg/zenoh_wasm_client_example_bg.wasm');
     // Start the zenoh worker event loop
-    await start_worker();
+    await wasm_bindgen.start_worker();
 }
 
 run().catch(e => {

@@ -29,9 +29,15 @@
 <body>
     <h1>Zenoh WASM Client (Web Worker)</h1>
     <div id="output"><p>Loading WASM module...</p></div>
-    <script type="module">
-        import init from './pkg/zenoh_wasm_client_example.js';
-        await init();
+    <script src="./pkg/zenoh_wasm_client_example.js"></script>
+    <script>
+        async function run() {
+            await wasm_bindgen('./pkg/zenoh_wasm_client_example_bg.wasm');
+            wasm_bindgen.start_main();
+        }
+        run().catch(e => {
+            document.getElementById('output').innerHTML += '<p>INIT ERROR: ' + e + '</p>';
+        });
     </script>
 </body>
 </html>
