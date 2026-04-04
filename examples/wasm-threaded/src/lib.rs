@@ -88,31 +88,29 @@ pub async fn run_threaded_test() {
     }
 
     // Test 5: zenoh session open (requires zenohd on ws/127.0.0.1:7448)
-    // NOTE: This test currently hangs because zenoh::open() internally spawns
-    // tasks across ZRuntime variants. Cross-worker flume channels work for
-    // JoinHandle (via setTimeout re-poll), but zenoh's internal signaling
-    // (bare channels, Notify, etc.) doesn't have the cross-thread wake
-    // adaptation yet. This will be fixed by adding setTimeout-based wake
-    // to all cross-worker async channels.
-    //
-    // Uncomment to test when cross-worker async signaling is complete:
-    //
-    // log("Test 5: zenoh session open on worker...");
-    // let h = zenoh_runtime::ZRuntime::Application.spawn(async {
-    //     let mut config = zenoh::Config::default();
-    //     config.insert_json5("mode", r#""client""#).unwrap();
-    //     config.insert_json5("connect/endpoints", r#"["ws/127.0.0.1:7448"]"#).unwrap();
-    //     config.insert_json5("scouting/multicast/enabled", "false").unwrap();
-    //     match zenoh::open(config).await {
-    //         Ok(session) => { let zid = session.zid().to_string(); let _ = session.close().await; Some(zid) }
-    //         Err(e) => { web_sys::console::error_1(&JsValue::from_str(&format!("Open error: {e}"))); None }
-    //     }
-    // });
-    // match h.await {
-    //     Ok(Some(zid)) => log(&format!("  PASS: session opened, ZID={zid}")),
-    //     Ok(None) => log("  FAIL: session open returned error (is zenohd running?)"),
-    //     Err(e) => log(&format!("  FAIL: join error: {e}")),
-    // }
+    log("Test 5: zenoh session open on worker...");
+    let h = zenoh_runtime::ZRuntime::Application.spawn(async {
+        let mut config = zenoh::Config::default();
+        config.insert_json5("mode", r#""client""#).unwrap();
+        config.insert_json5("connect/endpoints", r#"["ws/127.0.0.1:7448"]"#).unwrap();
+        config.insert_json5("scouting/multicast/enabled", "false").unwrap();
+        match zenoh::open(config).await {
+            Ok(session) => {
+                let zid = session.zid().to_string();
+                let _ = session.close().await;
+                Some(zid)
+            }
+            Err(e) => {
+                web_sys::console::error_1(&JsValue::from_str(&format!("Open error: {e}")));
+                None
+            }
+        }
+    });
+    match h.await {
+        Ok(Some(zid)) => log(&format!("  PASS: session opened, ZID={zid}")),
+        Ok(None) => log("  FAIL: session open returned error (is zenohd running on ws/127.0.0.1:7448?)"),
+        Err(e) => log(&format!("  FAIL: join error: {e}")),
+    }
 
     log("=== Tests complete ===");
 }

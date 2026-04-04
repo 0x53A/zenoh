@@ -241,6 +241,13 @@ pub fn __zenoh_worker_entry(variant_id: u32) {
     // Signal that this worker is ready
     WORKERS_READY.fetch_add(1, Ordering::Release);
 
+    // Start a periodic nudge (setInterval) that re-polls pending spawn_local futures.
+    // This is necessary because cross-worker wakes (e.g., flume tx.send() from
+    // worker A calling a waker registered on worker B) use queueMicrotask which
+    // is thread-local. The nudge ensures pending futures on this worker get
+    // re-polled even when their waker was called from another worker.
+    start_poll_nudge();
+
     // Run the task drain loop on this worker's JS event loop.
     wasm_bindgen_futures::spawn_local(async move {
         loop {
@@ -250,6 +257,30 @@ pub fn __zenoh_worker_entry(variant_id: u32) {
             }
         }
     });
+}
+
+/// Start a setInterval that periodically triggers a re-poll of all pending
+/// spawn_local futures on the current worker. This bridges cross-worker wakes.
+fn start_poll_nudge() {
+    use wasm_bindgen::closure::Closure;
+
+    let cb = Closure::wrap(Box::new(|| {
+        // Spawn an immediately-resolving future. This forces wasm_bindgen_futures'
+        // executor to run its poll loop, which re-polls any pending futures
+        // whose wakers may have been called from other workers.
+        wasm_bindgen_futures::spawn_local(async {});
+    }) as Box<dyn FnMut()>);
+
+    // 5ms interval — frequent enough for responsiveness, light enough for perf.
+    // The actual work per nudge is near-zero if no futures are pending.
+    set_interval(&cb, 5);
+    cb.forget(); // Runs for the lifetime of the worker
+}
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = "setInterval")]
+    fn set_interval(closure: &Closure<dyn FnMut()>, millis: i32);
 }
 
 /// URL of the wasm-bindgen JS shim. Set during init, read by workers.

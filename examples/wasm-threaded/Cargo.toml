@@ -23,3 +23,16 @@ web-sys = { version = "0.3", features = [
   "HtmlElement",
   "Window",
 ] }
+
+# Prevent mio/net compilation on wasm32 by disabling default features on
+# tokio and tokio-util. Without this, tokio-util enables tokio's "default"
+# features which include "net" → "mio", and mio doesn't support wasm32.
+[dependencies.tokio]
+version = "1"
+default-features = false
+features = ["sync", "macros", "rt"]
+
+[dependencies.tokio-util]
+version = "0.7"
+default-features = false
+features = ["rt"]
