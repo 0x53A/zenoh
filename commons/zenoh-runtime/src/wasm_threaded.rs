@@ -523,7 +523,9 @@ impl ZRuntime {
             }
         }
 
-        // Threaded mode: real blocking via Condvar
+        // Threaded mode: real blocking via Condvar with periodic timeout.
+        // The timeout ensures we re-poll even if a waker notification was missed
+        // (e.g., waker called between poll returning Pending and entering wait).
         let mut f = std::pin::pin!(f);
         let cv_waker = Arc::new(CondvarWaker {
             woken: Mutex::new(false),
@@ -536,11 +538,18 @@ impl ZRuntime {
             match f.as_mut().poll(&mut cx) {
                 Poll::Ready(val) => return val,
                 Poll::Pending => {
-                    // Block until the waker is called (from another worker).
-                    // Condvar::wait compiles to memory.atomic.wait32 — real blocking.
+                    // Wait for the waker with a timeout. The timeout (5ms) ensures
+                    // we re-poll periodically, which handles cases where:
+                    // - The waker was called before we entered wait
+                    // - Cross-worker wake notifications were delayed
+                    // - The poll nudge on other workers triggered state changes
                     let mut woken = cv_waker.woken.lock().unwrap();
-                    while !*woken {
-                        woken = cv_waker.cvar.wait(woken).unwrap();
+                    if !*woken {
+                        let (_guard, _timeout) = cv_waker
+                            .cvar
+                            .wait_timeout(woken, std::time::Duration::from_millis(5))
+                            .unwrap();
+                        woken = _guard;
                     }
                     *woken = false;
                 }

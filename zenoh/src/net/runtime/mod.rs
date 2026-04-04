@@ -997,56 +997,56 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
                     runtime: &Runtime,
                     new_peer: &TransportPeer,
                 ) -> usize {
-                    ZRuntime::Application.block_in_place(async {
-                        runtime
-                            .manager()
-                            .get_transports_unicast()
-                            .await
-                            .iter()
-                            .filter(|transport| {
-                                let Ok(peer) = transport.get_peer() else {
-                                    tracing::error!(
-                                        "Could not get transport peer \
-                                        while computing north-bound transport count. \
-                                        Will ignore this transport"
-                                    );
-                                    return false;
-                                };
+                    // Use the blocking variant to avoid block_in_place, which on
+                    // WASM with SharedArrayBuffer would freeze the JS event loop
+                    // and deadlock WebSocket callbacks.
+                    runtime
+                        .manager()
+                        .get_transports_unicast_blocking()
+                        .iter()
+                        .filter(|transport| {
+                            let Ok(peer) = transport.get_peer() else {
+                                tracing::error!(
+                                    "Could not get transport peer \
+                                    while computing north-bound transport count. \
+                                    Will ignore this transport"
+                                );
+                                return false;
+                            };
 
-                                let Ok(remote_bound) = transport.get_bound() else {
-                                    tracing::error!(
-                                        "Could not get transport remote bound \
-                                        while computing north-bound transport count. \
-                                        Will ignore this transport"
-                                    );
-                                    return false;
-                                };
+                            let Ok(remote_bound) = transport.get_bound() else {
+                                tracing::error!(
+                                    "Could not get transport remote bound \
+                                    while computing north-bound transport count. \
+                                    Will ignore this transport"
+                                );
+                                return false;
+                            };
 
-                                if &peer == new_peer {
-                                    return false;
-                                }
+                            if &peer == new_peer {
+                                return false;
+                            }
 
-                                // NOTE(regions): compute bound instead of querying the router as
-                                // the corresponding transport face might not exist yet
-                                let Ok((region, _)) = region::compute_region_of(
-                                    &peer,
-                                    &runtime.config().lock(),
-                                    remote_bound.as_ref(),
-                                ) else {
-                                    tracing::error!(
-                                        zid = %peer.zid.short(),
-                                        wai = %peer.whatami,
-                                        "Could not get transport peer region \
-                                        while computing north-bound transport count. \
-                                        Will ignore this transport"
-                                    );
-                                    return false;
-                                };
+                            // NOTE(regions): compute bound instead of querying the router as
+                            // the corresponding transport face might not exist yet
+                            let Ok((region, _)) = region::compute_region_of(
+                                &peer,
+                                &runtime.config().lock(),
+                                remote_bound.as_ref(),
+                            ) else {
+                                tracing::error!(
+                                    zid = %peer.zid.short(),
+                                    wai = %peer.whatami,
+                                    "Could not get transport peer region \
+                                    while computing north-bound transport count. \
+                                    Will ignore this transport"
+                                );
+                                return false;
+                            };
 
-                                region.bound().is_north()
-                            })
-                            .count()
-                    })
+                            region.bound().is_north()
+                        })
+                        .count()
                 }
 
                 if region.bound().is_north()
