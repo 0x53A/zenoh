@@ -5,5 +5,8 @@ rustflags = "-Ctarget-feature=-crt-static"
 rustflags = "-Ctarget-feature=-crt-static"
 
 [target.wasm32-unknown-unknown]
-rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+rustflags = [
+  '--cfg', 'getrandom_backend="wasm_js"',
+  '-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals',
+]
 

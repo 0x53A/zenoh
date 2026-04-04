@@ -23,9 +23,14 @@ mod native;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::*;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
+mod wasm_threaded;
+#[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
+pub use wasm_threaded::*;
+
+#[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
 mod wasm;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
 pub use wasm::*;
 
 pub mod compat;

@@ -5577,6 +5577,7 @@ version = "1.9.0"
 dependencies = [
  "flume",
  "futures",
+ "js-sys",
  "lazy_static",
  "ron",
  "serde",
@@ -5584,6 +5585,7 @@ dependencies = [
  "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
  "zenoh-macros",
  "zenoh-result",
 ]

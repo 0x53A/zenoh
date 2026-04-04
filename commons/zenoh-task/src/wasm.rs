@@ -83,10 +83,10 @@ impl CancellationToken {
     }
 
     /// Runs a future until this token is cancelled (owned version).
-    pub fn run_until_cancelled_owned<F: Future>(
+    pub fn run_until_cancelled_owned<F: Future + Send>(
         &self,
         future: F,
-    ) -> impl Future<Output = Option<F::Output>> {
+    ) -> impl Future<Output = Option<F::Output>> + Send {
         let inner = self.inner.clone();
         async move {
             if inner.cancelled.load(Ordering::SeqCst) {
@@ -156,10 +156,10 @@ impl TaskController {
     pub fn into_abortable<'a, F, T>(
         &self,
         future: F,
-    ) -> impl Future<Output = Option<T>> + 'a
+    ) -> impl Future<Output = Option<T>> + Send + 'a
     where
-        F: Future<Output = T> + 'a,
-        T: 'static,
+        F: Future<Output = T> + Send + 'a,
+        T: Send + 'static,
     {
         self.token
             .child_token()
@@ -168,8 +168,8 @@ impl TaskController {
 
     pub fn spawn_abortable<F, T>(&self, future: F) -> JoinHandle<Option<T>>
     where
-        F: Future<Output = T> + 'static,
-        T: 'static,
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
     {
         let count = self.task_count.clone();
         count.fetch_add(1, Ordering::SeqCst);
@@ -188,8 +188,8 @@ impl TaskController {
         future: F,
     ) -> JoinHandle<Option<T>>
     where
-        F: Future<Output = T> + 'static,
-        T: 'static,
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
     {
         let count = self.task_count.clone();
         count.fetch_add(1, Ordering::SeqCst);
@@ -208,8 +208,8 @@ impl TaskController {
 
     pub fn spawn<F, T>(&self, future: F) -> JoinHandle<T>
     where
-        F: Future<Output = T> + 'static,
-        T: 'static,
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
     {
         let count = self.task_count.clone();
         count.fetch_add(1, Ordering::SeqCst);
@@ -223,8 +223,8 @@ impl TaskController {
 
     pub fn spawn_with_rt<F, T>(&self, rt: ZRuntime, future: F) -> JoinHandle<T>
     where
-        F: Future<Output = T> + 'static,
-        T: 'static,
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
     {
         let count = self.task_count.clone();
         count.fetch_add(1, Ordering::SeqCst);
@@ -267,8 +267,8 @@ impl TerminatableTask {
 
     pub fn spawn<F, T>(rt: ZRuntime, future: F, token: CancellationToken) -> TerminatableTask
     where
-        F: Future<Output = T> + 'static,
-        T: 'static,
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
     {
         TerminatableTask {
             handle: Some(rt.spawn(future.map(|_f| ()))),
@@ -278,8 +278,8 @@ impl TerminatableTask {
 
     pub fn spawn_abortable<F, T>(rt: ZRuntime, future: F) -> TerminatableTask
     where
-        F: Future<Output = T> + 'static,
-        T: 'static,
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
     {
         let token = CancellationToken::new();
         let token2 = token.clone();
