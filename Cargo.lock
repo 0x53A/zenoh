@@ -6736,6 +6736,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "wasm-bindgen-futures",
  "zenoh-buffers",
  "zenoh-codec",
  "zenoh-config",

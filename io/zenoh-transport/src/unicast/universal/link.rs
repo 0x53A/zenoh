@@ -520,7 +520,25 @@ impl TimeoutTracker {
             has_timed_out: AtomicBool::new(false),
             latest_reset: Mutex::new(now),
         });
-        // On WASM, no background task for timeout tracking; timeouts will not fire
+        // On WASM, use a spawn_local + sleep_ms loop for timeout tracking
+        let tracker = Arc::downgrade(&inner);
+        let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut latest_reset = now;
+            loop {
+                zenoh_runtime::wasm_yield::sleep_ms(timeout_ms).await;
+                let prev = latest_reset;
+                let Some(tracker) = tracker.upgrade() else {
+                    break;
+                };
+                latest_reset = *tracker.latest_reset.lock().unwrap();
+                if latest_reset <= prev {
+                    latest_reset = Instant::now();
+                    tracker.has_timed_out.store(true, Ordering::Release);
+                    tracker.waker.wake();
+                }
+            }
+        });
         Self(inner)
     }
 
