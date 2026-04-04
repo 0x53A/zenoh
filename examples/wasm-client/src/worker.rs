@@ -83,6 +83,8 @@ pub async fn start_worker() {
                 log_to_main(&scope, &format!("Opening session to {}...", endpoint));
                 let mut config = zenoh::Config::default();
                 let endpoints = format!(r#"["{}"]"#, endpoint);
+                // Client mode — connect to router, no peer-to-peer
+                let _ = config.insert_json5("mode", r#""client""#);
                 if let Err(e) = config.insert_json5("connect/endpoints", &endpoints) {
                     post_to_main(&scope, &FromWorker::Error {
                         message: format!("Config error: {e}"),
