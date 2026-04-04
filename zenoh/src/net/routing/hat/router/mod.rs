@@ -83,8 +83,7 @@ impl TreesComputationWorker {
                 .await;
                 #[cfg(target_arch = "wasm32")]
                 {
-                    // On WASM, tokio::time is not available; yield to allow other tasks to run
-                    tokio::task::yield_now().await;
+                    zenoh_runtime::wasm_yield::yield_now().await;
                 }
 
                 if let Ok(tables_ref) = rx.recv_async().await {

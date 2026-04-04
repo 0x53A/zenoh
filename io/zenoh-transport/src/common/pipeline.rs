@@ -995,17 +995,8 @@ pub(crate) trait PipelineConsumer {
             tokio::task::yield_now().await;
             #[cfg(target_arch = "wasm32")]
             {
-                // yield_now equivalent for WASM
-                let mut yielded = false;
-                std::future::poll_fn(|cx| {
-                    if yielded {
-                        std::task::Poll::Ready(())
-                    } else {
-                        yielded = true;
-                        cx.waker().wake_by_ref();
-                        std::task::Poll::Pending
-                    }
-                }).await;
+                // Yield to the browser event loop via setTimeout(0).
+                zenoh_runtime::wasm_yield::yield_now().await;
             }
 
             // Wait for the backoff to expire or for a new message
