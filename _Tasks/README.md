@@ -3,10 +3,19 @@
 Port of Eclipse Zenoh to `wasm32-unknown-unknown` with WebSocket transport,
 enabling browser-based zenoh clients via Web Workers.
 
-## Status: Working prototype
+## Status: Working prototype + threadpool in progress
 
-Pub/sub works end-to-end: browser ↔ router ↔ CLI / other browsers.
-See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for limitations.
+**Single-threaded (default):** Pub/sub works end-to-end: browser ↔ router ↔ CLI.
+7 automated tests pass (5 basic + 2 session with router).
+
+**Multi-threaded (`wasm-threads` feature):** SharedArrayBuffer Web Workers with
+shared WASM memory. 4/5 tests pass (cross-worker spawn, multi-runtime, config,
+block_in_place with Condvar). Session open hangs because workers use
+`spawn_local` (JS microtask queue) which can't be pumped from `block_in_place`.
+
+**Next step:** Replace `spawn_local` on threadpool workers with a pure-Rust
+`LocalExecutor` that `block_in_place` can pump. See
+[THREADPOOL_ARCHITECTURE.md](THREADPOOL_ARCHITECTURE.md) for the full plan.
 
 ## Documentation
 
@@ -14,6 +23,8 @@ See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for limitations.
   phase by phase, with rationale for each design decision
 - [KNOWN_ISSUES.md](KNOWN_ISSUES.md) — Known issues, weaknesses, and
   testing gaps with severity levels and fix suggestions
+- [THREADPOOL_ARCHITECTURE.md](THREADPOOL_ARCHITECTURE.md) — Design for
+  pure-Rust threadpool (SharedArrayBuffer workers with custom executor)
 
 ## Quick start
 
