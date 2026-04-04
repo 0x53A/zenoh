@@ -24,7 +24,13 @@ pub use tokio::sync::{
     Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock as AsyncRwLock,
 };
 
-#[cfg(target_arch = "wasm32")]
+// With wasm-threads (SharedArrayBuffer), use tokio::sync::Mutex which
+// works correctly with cross-worker waking and block_in_place.
+// Without wasm-threads, futures::lock::Mutex is fine for single-threaded.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
+pub use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
+
+#[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
 pub use futures::lock::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 // futures doesn't have RwLock — on WASM, use std's.
