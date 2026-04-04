@@ -115,18 +115,49 @@ impl<T> Future for JoinHandle<T> {
         match self.rx.try_recv() {
             Ok(val) => Poll::Ready(Ok(val)),
             Err(flume::TryRecvError::Empty) => {
-                let rx = self.rx.clone();
-                let mut fut = Box::pin(async move { rx.recv_async().await });
-                match fut.as_mut().poll(cx) {
-                    Poll::Ready(Ok(val)) => Poll::Ready(Ok(val)),
-                    Poll::Ready(Err(_)) => Poll::Ready(Err(JoinError)),
-                    Poll::Pending => Poll::Pending,
+                if THREADED_MODE.load(Ordering::Acquire) {
+                    // In threaded mode, the result may arrive from another worker.
+                    // JS wakers are per-thread (spawn_local uses microtasks), so a
+                    // waker from worker A can't schedule a re-poll on worker B.
+                    // Solution: use setTimeout(0) to re-poll on this thread's event loop.
+                    let waker = cx.waker().clone();
+                    schedule_waker_repoll(waker);
+                    Poll::Pending
+                } else {
+                    // Single-threaded: use flume's async recv which works on one thread.
+                    let rx = self.rx.clone();
+                    let mut fut = Box::pin(async move { rx.recv_async().await });
+                    match fut.as_mut().poll(cx) {
+                        Poll::Ready(Ok(val)) => Poll::Ready(Ok(val)),
+                        Poll::Ready(Err(_)) => Poll::Ready(Err(JoinError)),
+                        Poll::Pending => Poll::Pending,
+                    }
                 }
             }
             Err(flume::TryRecvError::Disconnected) => Poll::Ready(Err(JoinError)),
         }
     }
 }
+
+/// Schedule a waker to fire after yielding to the JS event loop.
+/// Uses `setTimeout(0)` (~4ms in browsers) to re-poll on the current thread.
+/// This bridges the gap between cross-worker flume channels and per-thread
+/// JS event loops.
+fn schedule_waker_repoll(waker: std::task::Waker) {
+    use wasm_bindgen::closure::Closure;
+    let cb = Closure::once(move || {
+        waker.wake();
+    });
+    set_timeout(&cb, 1);
+    cb.forget(); // One-shot, leaked — acceptable for waker re-polls
+}
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = "setTimeout")]
+    fn set_timeout(closure: &Closure<dyn FnMut()>, millis: i32);
+}
+
 
 impl<T> JoinHandle<T> {
     pub fn abort(&self) {
@@ -211,8 +242,6 @@ pub fn __zenoh_worker_entry(variant_id: u32) {
     WORKERS_READY.fetch_add(1, Ordering::Release);
 
     // Run the task drain loop on this worker's JS event loop.
-    // Each received task is a closure that calls spawn_local internally,
-    // so it integrates with this worker's microtask queue.
     wasm_bindgen_futures::spawn_local(async move {
         loop {
             match rx.recv_async().await {
@@ -223,8 +252,11 @@ pub fn __zenoh_worker_entry(variant_id: u32) {
     });
 }
 
+/// URL of the wasm-bindgen JS shim. Set during init, read by workers.
+static SHIM_URL: OnceLock<String> = OnceLock::new();
+
 impl WorkerPool {
-    fn new() -> Self {
+    fn new(shim_url: &str) -> Self {
         // Create task channels for each worker
         let mut senders = Vec::with_capacity(NUM_WORKERS);
         let mut receivers = Vec::with_capacity(NUM_WORKERS);
@@ -242,7 +274,7 @@ impl WorkerPool {
         // Spawn Web Workers
         let mut workers = Vec::with_capacity(NUM_WORKERS);
         for (variant_id, tx) in senders.into_iter().enumerate() {
-            let worker = Self::spawn_worker(variant_id as u32);
+            let worker = Self::spawn_worker(variant_id as u32, shim_url);
             workers.push(WorkerHandle {
                 task_tx: tx,
                 _worker: SendWrapper(worker),
@@ -252,47 +284,48 @@ impl WorkerPool {
         WorkerPool { workers }
     }
 
+    /// Resolve a potentially relative URL to an absolute one using the page's location.
+    fn resolve_url(url: &str) -> String {
+        js_sys::eval(&format!(
+            "new URL('{}', self.location.href).href",
+            url.replace('\'', "\\'")
+        ))
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_else(|| url.to_string())
+    }
+
     /// Spawn a Web Worker that shares our WASM module and linear memory.
     ///
-    /// The worker receives the WebAssembly.Module and Memory via postMessage,
-    /// re-instantiates the module with the shared memory, then calls
-    /// `__zenoh_worker_entry(variant_id)` to start its event loop.
-    fn spawn_worker(variant_id: u32) -> web_sys::Worker {
-        // The JS code for the worker:
-        // - Receives [module, memory, variant_id] via onmessage
-        // - Calls wasm_bindgen(module, memory) to init with shared memory
-        // - Calls the exported __zenoh_worker_entry(variant_id)
-        //
-        // For --target no-modules: uses importScripts + wasm_bindgen global
-        // For --target web: uses import() + init() pattern
-        //
-        // We use the no-modules approach since the existing wasm-client example
-        // uses importScripts (classic workers for browser compat).
-        let js_code = r#"
-            self.onmessage = async function(e) {
-                const [module, memory, variant_id] = e.data;
-                // wasm_bindgen is available as a global after the WASM module
-                // is instantiated. We re-init with the shared memory.
-                const instance = await WebAssembly.instantiate(module, {
-                    './zenoh_wasm_bg.js': self.__wbg_star0,
-                    env: { memory },
-                    __wbindgen_thread_xform__: { __wbindgen_thread_id: () => variant_id },
-                });
-                // Initialize wasm-bindgen glue with the shared instance
-                // The generated __wbg_init function or wasm_bindgen() handles this.
-                if (typeof wasm_bindgen !== 'undefined') {
-                    await wasm_bindgen(module, memory);
-                    wasm_bindgen.__zenoh_worker_entry(variant_id);
-                } else {
-                    // Fallback: direct call via instance exports
-                    instance.exports.__zenoh_worker_entry(variant_id);
-                }
-            };
-        "#;
+    /// The worker:
+    /// 1. Loads the wasm-bindgen JS shim via importScripts
+    /// 2. Receives [module, memory, variant_id] via onmessage
+    /// 3. Calls wasm_bindgen(module, memory) to init with shared memory
+    /// 4. Calls __zenoh_worker_entry(variant_id) to start its event loop
+    fn spawn_worker(variant_id: u32, shim_url: &str) -> web_sys::Worker {
+        // Resolve to absolute URL — relative URLs don't work in Blob URL workers.
+        let abs_shim_url = Self::resolve_url(shim_url);
+
+        // Worker JS: load the wasm-bindgen shim, then init with shared memory.
+        // With +atomics, wasm_bindgen(module, memory) accepts two args —
+        // the Module and the shared Memory (backed by SharedArrayBuffer).
+        let js_code = format!(
+            r#"importScripts('{}');
+self.onmessage = async function(e) {{
+    const [module, memory, variant_id] = e.data;
+    try {{
+        await wasm_bindgen(module, memory);
+        wasm_bindgen.__zenoh_worker_entry(variant_id);
+    }} catch(err) {{
+        console.error('[zenoh-worker:' + variant_id + '] error:', err);
+    }}
+}};"#,
+            abs_shim_url
+        );
 
         // Create a Blob URL for the worker script
         let blob = web_sys::Blob::new_with_str_sequence_and_options(
-            &js_sys::Array::of1(&JsValue::from_str(js_code)),
+            &js_sys::Array::of1(&JsValue::from_str(&js_code)),
             web_sys::BlobPropertyBag::new().type_("application/javascript"),
         )
         .expect("Failed to create worker blob");
@@ -302,15 +335,15 @@ impl WorkerPool {
 
         let worker = web_sys::Worker::new(&url).expect("Failed to create Web Worker");
 
-        // Clean up the blob URL
+        // Clean up the blob URL (worker already has the script)
         let _ = web_sys::Url::revoke_object_url(&url);
 
-        // Send the WASM module, shared memory, and variant_id to the worker
-        let module = wasm_bindgen::module();
-        let memory = wasm_bindgen::memory();
+        // Post the WASM module + shared memory + variant_id to the worker.
+        // wasm_bindgen::module() returns the WebAssembly.Module.
+        // wasm_bindgen::memory() returns the WebAssembly.Memory (shared with SAB).
         let init_data = js_sys::Array::new();
-        init_data.push(&module);
-        init_data.push(&memory);
+        init_data.push(&wasm_bindgen::module());
+        init_data.push(&wasm_bindgen::memory());
         init_data.push(&JsValue::from(variant_id));
 
         worker
@@ -333,13 +366,18 @@ static THREADED_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Initialize the threaded WASM runtime.
 ///
-/// Creates Web Workers for each ZRuntime variant. Must be called from a context
-/// with access to the JS global scope (main thread or an existing worker).
+/// Creates Web Workers for each ZRuntime variant, sharing the WASM module and
+/// linear memory via SharedArrayBuffer.
 ///
-/// If SharedArrayBuffer is not available (missing COOP/COEP headers), this
-/// will fail and the runtime falls back to single-threaded mode.
+/// # Arguments
+/// * `shim_url` — URL to the wasm-bindgen JS shim file (e.g., `"./pkg/my_crate.js"`).
+///   Workers will load this via `importScripts()`.
+///
+/// # Returns
+/// `true` if threaded mode was activated, `false` if falling back to single-threaded
+/// (e.g., SharedArrayBuffer not available due to missing COOP/COEP headers).
 #[wasm_bindgen]
-pub fn __zenoh_init_threaded_runtime() -> bool {
+pub fn __zenoh_init_threaded_runtime(shim_url: &str) -> bool {
     // Check if SharedArrayBuffer is available
     let sab_available = js_sys::eval("typeof SharedArrayBuffer !== 'undefined'")
         .map(|v| v.as_bool().unwrap_or(false))
@@ -353,7 +391,8 @@ pub fn __zenoh_init_threaded_runtime() -> bool {
         return false;
     }
 
-    WORKER_POOL.get_or_init(WorkerPool::new);
+    let _ = SHIM_URL.set(shim_url.to_string());
+    WORKER_POOL.get_or_init(|| WorkerPool::new(shim_url));
     THREADED_MODE.store(true, Ordering::Release);
     tracing::info!("Zenoh threaded WASM runtime initialized with {} workers", NUM_WORKERS);
     true
