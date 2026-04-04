@@ -90,10 +90,12 @@ pub async fn run_threaded_test() {
     // Test 5: zenoh session open (requires zenohd on ws/127.0.0.1:7448)
     log("Test 5: zenoh session open on worker...");
     let h = zenoh_runtime::ZRuntime::Application.spawn(async {
+        web_sys::console::log_1(&JsValue::from_str("[test5] creating config..."));
         let mut config = zenoh::Config::default();
         config.insert_json5("mode", r#""client""#).unwrap();
         config.insert_json5("connect/endpoints", r#"["ws/127.0.0.1:7448"]"#).unwrap();
         config.insert_json5("scouting/multicast/enabled", "false").unwrap();
+        web_sys::console::log_1(&JsValue::from_str("[test5] calling zenoh::open()..."));
         match zenoh::open(config).await {
             Ok(session) => {
                 let zid = session.zid().to_string();

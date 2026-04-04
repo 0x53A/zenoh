@@ -52,16 +52,14 @@ enum WriteCmd {
 }
 
 pub struct LinkUnicastWs {
-    /// Channel for sending write requests to the worker that owns the WebSocket.
-    /// The worker runs a spawn_local loop that dequeues and calls ws.send().
+    /// Channel for sending write requests to the I/O worker that owns the WebSocket.
     write_tx: flume::Sender<WriteCmd>,
     recv_rx: flume::Receiver<Vec<u8>>,
     src_locator: Locator,
     dst_locator: Locator,
     leftovers: tokio::sync::Mutex<Option<(Vec<u8>, usize, usize)>>,
-    /// Stored JS closures — dropped on close() to avoid memory leaks.
-    _closures: SendWrapper<Vec<Closure<dyn FnMut(MessageEvent)>>>,
-    _error_closures: SendWrapper<Vec<Closure<dyn FnMut(ErrorEvent)>>>,
+    /// Dropping this signals the I/O worker to release WebSocket closures.
+    _io_close_tx: flume::Sender<()>,
 }
 
 
@@ -153,29 +151,68 @@ fn setup_ws(url: &str) -> ZResult<WsSetup> {
 
 impl LinkUnicastWs {
     async fn new(url: &str) -> ZResult<Self> {
-        // All !Send types are created and wrapped synchronously in setup_ws.
-        // Only Send types cross the .await boundary.
-        let setup = setup_ws(url)?;
-
-        // Wait for connection to open
-        match setup.open_rx.recv_async().await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => bail!("WebSocket connection failed: {}", e),
-            Err(_) => bail!("WebSocket open channel closed unexpectedly"),
-        }
-
-        let src_locator =
-            Locator::new(WS_LOCATOR_PREFIX, "wasm-client", "").unwrap();
+        let url_owned = url.to_string();
+        let src_locator = Locator::new(WS_LOCATOR_PREFIX, "wasm-client", "").unwrap();
         let dst_locator = Locator::new(WS_LOCATOR_PREFIX, url, "").unwrap();
 
+        // Dispatch WebSocket creation to the Acceptor worker (dedicated I/O worker).
+        // This ensures all JS WebSocket objects and their callbacks live on a worker
+        // that never calls block_in_place, preventing event loop deadlocks.
+        // The result channels (write_tx, recv_rx) cross back via shared memory.
+        let (result_tx, result_rx) = flume::bounded::<Result<
+            (flume::Sender<WriteCmd>, flume::Receiver<Vec<u8>>),
+            String,
+        >>(1);
+
+        // Use a close_rx channel to keep the Acceptor task (and its closures)
+        // alive until the link is closed.
+        let (close_tx, close_rx) = flume::bounded::<()>(1);
+
+        zenoh_runtime::ZRuntime::Acceptor.spawn(async move {
+            let setup = match setup_ws(&url_owned) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = result_tx.send(Err(format!("WebSocket setup failed: {e}")));
+                    return;
+                }
+            };
+
+            // Wait for connection to open (on the Acceptor worker's event loop)
+            match setup.open_rx.recv_async().await {
+                Ok(Ok(())) => {
+                    let _ = result_tx.send(Ok((setup.write_tx, setup.recv_rx)));
+                }
+                Ok(Err(e)) => {
+                    let _ = result_tx.send(Err(format!("WebSocket connection failed: {e}")));
+                    return;
+                }
+                Err(_) => {
+                    let _ = result_tx.send(Err("WebSocket open channel closed unexpectedly".into()));
+                    return;
+                }
+            }
+
+            // Keep closures alive until the link is closed.
+            // The close_rx channel blocks this task until close_tx is dropped.
+            let _closures = setup.msg_closures;
+            let _err_closures = setup.err_closures;
+            let _ = close_rx.recv_async().await;
+        });
+
+        // Wait for the Acceptor worker to establish the connection
+        let (write_tx, recv_rx) = result_rx
+            .recv_async()
+            .await
+            .map_err(|e| zerror!("I/O worker channel closed: {}", e))?
+            .map_err(|e| zerror!("{}", e))?;
+
         Ok(Self {
-            write_tx: setup.write_tx,
-            recv_rx: setup.recv_rx,
+            write_tx,
+            recv_rx,
             src_locator,
             dst_locator,
             leftovers: tokio::sync::Mutex::new(None),
-            _closures: setup.msg_closures,
-            _error_closures: setup.err_closures,
+            _io_close_tx: close_tx,
         })
     }
 }
