@@ -46,9 +46,6 @@ impl<T> std::ops::Deref for SendWrapper<T> {
 pub struct LinkUnicastWs {
     ws: SendWrapper<WebSocket>,
     recv_rx: flume::Receiver<Vec<u8>>,
-    // We hold closures to prevent them from being dropped
-    _on_message: SendWrapper<Closure<dyn FnMut(MessageEvent)>>,
-    _on_error: SendWrapper<Closure<dyn FnMut(ErrorEvent)>>,
     src_locator: Locator,
     dst_locator: Locator,
     leftovers: tokio::sync::Mutex<Option<(Vec<u8>, usize, usize)>>,
@@ -57,16 +54,15 @@ pub struct LinkUnicastWs {
 
 /// Result of synchronously setting up a WebSocket connection.
 /// All !Send types are already wrapped in SendWrapper.
+/// Closures are forgotten (leaked) to prevent drop issues — they live as long as the WebSocket.
 struct WsSetup {
     ws: SendWrapper<WebSocket>,
     recv_rx: flume::Receiver<Vec<u8>>,
     open_rx: flume::Receiver<Result<(), String>>,
-    on_message: SendWrapper<Closure<dyn FnMut(MessageEvent)>>,
-    on_error: SendWrapper<Closure<dyn FnMut(ErrorEvent)>>,
 }
 
 /// Create and configure WebSocket synchronously (no .await).
-/// Returns only Send-safe types.
+/// Returns only Send-safe types. JS closures are forgotten to avoid drop issues.
 fn setup_ws(url: &str) -> ZResult<WsSetup> {
     let ws = WebSocket::new(url)
         .map_err(|e| zerror!("Failed to create WebSocket to {}: {:?}", url, e))?;
@@ -83,6 +79,7 @@ fn setup_ws(url: &str) -> ZResult<WsSetup> {
         }
     }) as Box<dyn FnMut(MessageEvent)>);
     ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    on_message.forget(); // prevent drop — JS holds the reference
 
     let err_tx = open_tx.clone();
     let on_error = Closure::wrap(Box::new(move |e: ErrorEvent| {
@@ -91,20 +88,18 @@ fn setup_ws(url: &str) -> ZResult<WsSetup> {
         let _ = err_tx.send(Err(msg));
     }) as Box<dyn FnMut(ErrorEvent)>);
     ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+    on_error.forget(); // prevent drop — JS holds the reference
 
     let on_open = Closure::once(move |_: JsValue| {
         let _ = open_tx.send(Ok(()));
     });
     ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
-    // on_open is a one-shot closure; it will be dropped but that's fine
-    // since JS already has the reference.
+    on_open.forget(); // prevent drop — JS still holds the reference
 
     Ok(WsSetup {
         ws: SendWrapper(ws),
         recv_rx,
         open_rx,
-        on_message: SendWrapper(on_message),
-        on_error: SendWrapper(on_error),
     })
 }
 
@@ -131,8 +126,6 @@ impl LinkUnicastWs {
         Ok(Self {
             ws: setup.ws,
             recv_rx: setup.recv_rx,
-            _on_message: setup.on_message,
-            _on_error: setup.on_error,
             src_locator,
             dst_locator,
             leftovers: tokio::sync::Mutex::new(None),
@@ -144,6 +137,10 @@ impl LinkUnicastWs {
 impl LinkUnicastTrait for LinkUnicastWs {
     async fn close(&self) -> ZResult<()> {
         tracing::trace!("Closing WebSocket link: {}", self);
+        // Clear JS handlers before closing to prevent "closure dropped" errors
+        self.ws.set_onmessage(None);
+        self.ws.set_onerror(None);
+        self.ws.set_onclose(None);
         self.ws.close().map_err(|e| {
             zerror!("Failed to close WebSocket link {}: {:?}", self, e).into()
         })
