@@ -10,6 +10,13 @@ pub async fn main() {
         .without_time()
         .init();
 
+    // Better panic messages in the browser
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("PANIC: {}", info);
+        web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&msg));
+        log_to_page(&msg);
+    }));
+
     tracing::info!("zenoh WASM client starting...");
 
     if let Err(e) = run().await {
@@ -24,13 +31,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Connect to zenoh router on localhost:7447 via WebSocket
     // Change this to match your router's address
     config
-        .insert_json5("connect/endpoints", r#"["ws/127.0.0.1:7447"]"#)
+        .insert_json5("connect/endpoints", r#"["ws/127.0.0.1:7448"]"#)
         .map_err(|e| format!("Config error: {e}"))?;
     config
         .insert_json5("scouting/multicast/enabled", "false")
         .map_err(|e| format!("Config error: {e}"))?;
 
-    log_to_page("Opening zenoh session (connecting to ws/127.0.0.1:7447)...");
+    log_to_page("Opening zenoh session (connecting to ws/127.0.0.1:7448)...");
     let session = zenoh::open(config).await.map_err(|e| format!("Open error: {e}"))?;
     log_to_page(&format!("Session opened! ZID: {}", session.zid()));
 
@@ -52,30 +59,33 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Put error: {e}"))?;
     log_to_page("Published 'Hello from WASM!'");
 
-    // Receive messages
+    // Receive messages in a spawned task so we return from main
     log_to_page("Waiting for messages...");
-    loop {
-        match subscriber.recv_async().await {
-            Ok(sample) => {
-                let payload = sample
-                    .payload()
-                    .try_to_string()
-                    .unwrap_or_else(|e| e.to_string().into());
-                let msg = format!(
-                    "[{}] {} : {}",
-                    sample.kind(),
-                    sample.key_expr().as_str(),
-                    payload
-                );
-                tracing::info!("{}", msg);
-                log_to_page(&msg);
-            }
-            Err(e) => {
-                log_to_page(&format!("Recv error: {e}"));
-                break;
+    wasm_bindgen_futures::spawn_local(async move {
+        let _session = session; // keep session alive
+        loop {
+            match subscriber.recv_async().await {
+                Ok(sample) => {
+                    let payload = sample
+                        .payload()
+                        .try_to_string()
+                        .unwrap_or_else(|e| e.to_string().into());
+                    let msg = format!(
+                        "[{}] {} : {}",
+                        sample.kind(),
+                        sample.key_expr().as_str(),
+                        payload
+                    );
+                    tracing::info!("{}", msg);
+                    log_to_page(&msg);
+                }
+                Err(e) => {
+                    log_to_page(&format!("Recv error: {e}"));
+                    break;
+                }
             }
         }
-    }
+    });
 
     Ok(())
 }

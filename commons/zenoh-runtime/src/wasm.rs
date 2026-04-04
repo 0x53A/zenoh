@@ -20,7 +20,16 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Wake};
+
+/// A no-op waker for single-poll attempts on WASM.
+fn noop_waker() -> std::task::Waker {
+    struct NoopWaker;
+    impl Wake for NoopWaker {
+        fn wake(self: std::sync::Arc<Self>) {}
+    }
+    std::sync::Arc::new(NoopWaker).into()
+}
 
 use serde::Deserialize;
 
@@ -135,11 +144,29 @@ impl ZRuntime {
     }
 
     /// On WASM, `block_in_place` cannot truly block.
-    pub fn block_in_place<F, R>(&self, _f: F) -> R
+    /// We attempt to poll the future once — if it resolves immediately, we return the result.
+    /// If it's Pending, we panic since we can't block on single-threaded WASM.
+    #[track_caller]
+    pub fn block_in_place<F, R>(&self, f: F) -> R
     where
         F: Future<Output = R>,
     {
-        panic!("block_in_place is not supported on WASM — use async/.await instead")
+        let mut f = std::pin::pin!(f);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match f.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => result,
+            Poll::Pending => {
+                let caller = std::panic::Location::caller();
+                panic!(
+                    "block_in_place: future returned Pending on WASM — cannot block \
+                     (called from {}:{}:{})",
+                    caller.file(),
+                    caller.line(),
+                    caller.column()
+                )
+            }
+        }
     }
 }
 
