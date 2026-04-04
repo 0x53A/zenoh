@@ -1,93 +1,109 @@
+mod protocol;
+mod worker;
+
 use wasm_bindgen::prelude::*;
+use web_sys::Worker;
 
-/// Entry point called from JavaScript.
+use protocol::{FromWorker, ToWorker};
+
+/// Main thread entry point.
 #[wasm_bindgen(start)]
-pub async fn main() {
-    // Set up tracing to browser console
-    tracing_subscriber::fmt()
-        .with_writer(tracing_web::MakeConsoleWriter)
-        .with_max_level(tracing::Level::INFO)
-        .without_time()
-        .init();
-
-    // Better panic messages in the browser
+pub fn main() {
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("PANIC: {}", info);
-        web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&msg));
+        web_sys::console::error_1(&JsValue::from_str(&msg));
         log_to_page(&msg);
     }));
 
-    tracing::info!("zenoh WASM client starting...");
+    log_to_page("Starting zenoh worker...");
 
-    if let Err(e) = run().await {
-        tracing::error!("Error: {}", e);
-        log_to_page(&format!("ERROR: {}", e));
-    }
-}
+    // Spawn the Web Worker using the worker bootstrap JS
+    let worker = Worker::new_with_options(
+        "./worker_bootstrap.js",
+        web_sys::WorkerOptions::new().type_(web_sys::WorkerType::Module),
+    )
+    .expect("Failed to create Web Worker");
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Configure zenoh to connect to a router via WebSocket
-    let mut config = zenoh::Config::default();
-    // Connect to zenoh router on localhost:7447 via WebSocket
-    // Change this to match your router's address
-    config
-        .insert_json5("connect/endpoints", r#"["ws/127.0.0.1:7448"]"#)
-        .map_err(|e| format!("Config error: {e}"))?;
-    config
-        .insert_json5("scouting/multicast/enabled", "false")
-        .map_err(|e| format!("Config error: {e}"))?;
-
-    log_to_page("Opening zenoh session (connecting to ws/127.0.0.1:7448)...");
-    let session = zenoh::open(config).await.map_err(|e| format!("Open error: {e}"))?;
-    log_to_page(&format!("Session opened! ZID: {}", session.zid()));
-
-    // Subscribe to demo/example/**
-    let key_expr = "demo/example/**";
-    log_to_page(&format!("Subscribing to '{key_expr}'..."));
-    let subscriber = session
-        .declare_subscriber(key_expr)
-        .await
-        .map_err(|e| format!("Subscribe error: {e}"))?;
-    log_to_page("Subscriber declared.");
-
-    // Publish a test message
-    let pub_key = "demo/example/wasm";
-    log_to_page(&format!("Publishing to '{pub_key}'..."));
-    session
-        .put(pub_key, "Hello from WASM!")
-        .await
-        .map_err(|e| format!("Put error: {e}"))?;
-    log_to_page("Published 'Hello from WASM!'");
-
-    // Receive messages in a spawned task so we return from main
-    log_to_page("Waiting for messages...");
-    wasm_bindgen_futures::spawn_local(async move {
-        let _session = session; // keep session alive
-        loop {
-            match subscriber.recv_async().await {
-                Ok(sample) => {
-                    let payload = sample
-                        .payload()
-                        .try_to_string()
-                        .unwrap_or_else(|e| e.to_string().into());
-                    let msg = format!(
-                        "[{}] {} : {}",
-                        sample.kind(),
-                        sample.key_expr().as_str(),
-                        payload
-                    );
-                    tracing::info!("{}", msg);
-                    log_to_page(&msg);
+    // Handle messages from worker
+    let onmessage = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
+        let data = event.data();
+        if let Some(json_str) = data.as_string() {
+            match serde_json::from_str::<FromWorker>(&json_str) {
+                Ok(FromWorker::Opened { zid }) => {
+                    log_to_page(&format!("Session opened! ZID: {zid}"));
+                }
+                Ok(FromWorker::Sample { key_expr, payload, kind, .. }) => {
+                    log_to_page(&format!("[{kind}] {key_expr} : {payload}"));
+                }
+                Ok(FromWorker::Error { message }) => {
+                    log_to_page(&format!("ERROR: {message}"));
+                }
+                Ok(FromWorker::Log { message }) => {
+                    log_to_page(&format!("worker: {message}"));
                 }
                 Err(e) => {
-                    log_to_page(&format!("Recv error: {e}"));
-                    break;
+                    log_to_page(&format!("Failed to parse worker message: {e}"));
                 }
             }
         }
+    }) as Box<dyn FnMut(web_sys::MessageEvent)>);
+    worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+    onmessage.forget();
+
+    // Handle worker errors
+    let onerror = Closure::wrap(Box::new(move |event: web_sys::ErrorEvent| {
+        log_to_page(&format!("Worker error: {}", event.message()));
+    }) as Box<dyn FnMut(web_sys::ErrorEvent)>);
+    worker.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+    onerror.forget();
+
+    // Send commands to worker
+    send_to_worker(&worker, &ToWorker::Open {
+        endpoint: "ws/127.0.0.1:7448".into(),
     });
 
-    Ok(())
+    // Subscribe after a short delay to let the session open
+    let worker_clone = worker.clone();
+    let subscribe_cb = Closure::once(move || {
+        send_to_worker(&worker_clone, &ToWorker::Subscribe {
+            id: 1,
+            key_expr: "demo/example/**".into(),
+        });
+
+        // Publish a test message after another short delay
+        let worker_clone2 = worker_clone.clone();
+        let put_cb = Closure::once(move || {
+            send_to_worker(&worker_clone2, &ToWorker::Put {
+                key_expr: "demo/example/wasm".into(),
+                payload: "Hello from WASM!".into(),
+            });
+        });
+        web_sys::window()
+            .unwrap()
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                put_cb.as_ref().unchecked_ref(),
+                500,
+            )
+            .unwrap();
+        put_cb.forget();
+    });
+    web_sys::window()
+        .unwrap()
+        .set_timeout_with_callback_and_timeout_and_arguments_0(
+            subscribe_cb.as_ref().unchecked_ref(),
+            1000,
+        )
+        .unwrap();
+    subscribe_cb.forget();
+
+    log_to_page("Commands queued. Waiting for worker...");
+}
+
+fn send_to_worker(worker: &Worker, msg: &ToWorker) {
+    let json = serde_json::to_string(msg).unwrap();
+    worker
+        .post_message(&JsValue::from_str(&json))
+        .expect("Failed to send message to worker");
 }
 
 /// Append a message to the page's output div.

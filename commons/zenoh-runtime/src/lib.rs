@@ -29,3 +29,7 @@ mod wasm;
 pub use wasm::*;
 
 pub mod compat;
+
+/// WASM-safe async yield/sleep utilities (Send-safe, works in Web Workers).
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_yield;

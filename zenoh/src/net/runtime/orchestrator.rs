@@ -635,9 +635,9 @@ impl Runtime {
             tokio::time::sleep(period.next_duration()).await;
             #[cfg(target_arch = "wasm32")]
             {
-                let _ = period.next_duration();
-                // On WASM, tokio::time is not available; yield instead
-                tokio::task::yield_now().await;
+                let duration = period.next_duration();
+                let ms = duration.as_millis().min(u32::MAX as u128) as u32;
+                zenoh_runtime::wasm_yield::sleep_ms(ms).await;
             }
         }
     }
@@ -885,10 +885,9 @@ impl Runtime {
             }
             #[cfg(target_arch = "wasm32")]
             {
-                // On WASM, tokio::time is not available; yield then retry immediately
-                let _ = wait_time;
+                let wait_ms = wait_time.as_millis().min(u32::MAX as u128) as u32;
                 tokio::select! {
-                    _ = async { tokio::task::yield_now().await } => {
+                    _ = zenoh_runtime::wasm_yield::sleep_ms(wait_ms) => {
                         Some((peer, period))
                     }
                     _ = cancellation_token.cancelled() => {

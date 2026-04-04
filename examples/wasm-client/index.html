@@ -27,11 +27,11 @@
     </style>
 </head>
 <body>
-    <h1>Zenoh WASM Client</h1>
+    <h1>Zenoh WASM Client (Web Worker)</h1>
     <div id="output"><p>Loading WASM module...</p></div>
     <script type="module">
         import init from './pkg/zenoh_wasm_client_example.js';
-        init();
+        await init();
     </script>
 </body>
 </html>
