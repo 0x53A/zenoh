@@ -30,6 +30,45 @@ use zenoh_result::{bail, zerror, ZResult};
 
 use super::{WS_DEFAULT_MTU, WS_LOCATOR_PREFIX};
 
+/// Receive from a flume channel with cross-worker wake support.
+/// Registers the waker in the global nudge registry so that the periodic
+/// setInterval can wake this future even when the sender is on another worker.
+async fn cross_worker_recv<T: Send + 'static>(rx: flume::Receiver<T>) -> Result<T, flume::RecvError> {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct CrossWorkerRecv<T: Send + 'static> {
+        rx: flume::Receiver<T>,
+        inner: Option<Pin<Box<dyn Future<Output = Result<T, flume::RecvError>> + Send>>>,
+    }
+
+    impl<T: Send + 'static> Future for CrossWorkerRecv<T> {
+        type Output = Result<T, flume::RecvError>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            // Try non-blocking receive first
+            match self.rx.try_recv() {
+                Ok(val) => return Poll::Ready(Ok(val)),
+                Err(flume::TryRecvError::Disconnected) => {
+                    return Poll::Ready(Err(flume::RecvError::Disconnected))
+                }
+                Err(flume::TryRecvError::Empty) => {}
+            }
+            // Register waker for cross-worker nudging
+            zenoh_runtime::register_cross_worker_waker(cx.waker());
+            // Poll the inner async recv
+            if self.inner.is_none() {
+                let rx = self.rx.clone();
+                self.inner = Some(Box::pin(async move { rx.recv_async().await }));
+            }
+            self.inner.as_mut().unwrap().as_mut().poll(cx)
+        }
+    }
+
+    CrossWorkerRecv { rx, inner: None }.await
+}
+
 /// Wrapper to make JsValue-based types Send+Sync on WASM.
 /// SAFETY: With shared-memory workers, the wrapped JS object is thread-affine —
 /// only accessed from the worker that created it. The write_tx channel ensures
@@ -199,9 +238,9 @@ impl LinkUnicastWs {
             let _ = close_rx.recv_async().await;
         });
 
-        // Wait for the Acceptor worker to establish the connection
-        let (write_tx, recv_rx) = result_rx
-            .recv_async()
+        // Wait for the Acceptor worker to establish the connection.
+        // Use a polling loop with waker registration for cross-worker wake.
+        let (write_tx, recv_rx) = cross_worker_recv(result_rx)
             .await
             .map_err(|e| zerror!("I/O worker channel closed: {}", e))?
             .map_err(|e| zerror!("{}", e))?;

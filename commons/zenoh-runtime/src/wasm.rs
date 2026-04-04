@@ -170,6 +170,9 @@ impl ZRuntime {
     }
 }
 
+/// No-op on single-threaded WASM — cross-worker waking isn't needed.
+pub fn register_cross_worker_waker(_waker: &std::task::Waker) {}
+
 // A runtime guard — no-op on WASM
 pub struct ZRuntimePoolGuard;
 

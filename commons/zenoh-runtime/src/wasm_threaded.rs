@@ -259,20 +259,45 @@ pub fn __zenoh_worker_entry(variant_id: u32) {
     });
 }
 
-/// Start a setInterval that periodically triggers a re-poll of all pending
-/// spawn_local futures on the current worker. This bridges cross-worker wakes.
+/// Global waker registry for cross-worker wake bridging.
+/// Each worker registers wakers of pending futures here. The poll nudge
+/// wakes ALL registered wakers, forcing the wasm_bindgen_futures executor
+/// to re-poll them.
+static WAKER_REGISTRY: Mutex<Vec<std::task::Waker>> = Mutex::new(Vec::new());
+
+/// Register a waker in the global registry for cross-worker nudging.
+pub fn register_cross_worker_waker(waker: &std::task::Waker) {
+    if let Ok(mut registry) = WAKER_REGISTRY.lock() {
+        // Replace existing waker for this thread or add new one.
+        // We keep a bounded set to avoid unbounded growth.
+        if registry.len() >= 64 {
+            // Compact: remove stale entries by waking and re-adding
+            let old = std::mem::take(&mut *registry);
+            for w in old {
+                w.wake();
+            }
+        }
+        registry.push(waker.clone());
+    }
+}
+
+/// Start a setInterval that periodically wakes ALL registered futures.
+/// This bridges cross-worker async channels where the waker was called
+/// from the wrong thread's microtask queue.
 fn start_poll_nudge() {
     use wasm_bindgen::closure::Closure;
 
     let cb = Closure::wrap(Box::new(|| {
-        // Spawn an immediately-resolving future. This forces wasm_bindgen_futures'
-        // executor to run its poll loop, which re-polls any pending futures
-        // whose wakers may have been called from other workers.
-        wasm_bindgen_futures::spawn_local(async {});
+        // Wake all registered wakers — this forces the executor to re-poll
+        // pending futures that may have been woken from other workers.
+        if let Ok(mut registry) = WAKER_REGISTRY.lock() {
+            for waker in registry.drain(..) {
+                waker.wake();
+            }
+        }
     }) as Box<dyn FnMut()>);
 
     // 5ms interval — frequent enough for responsiveness, light enough for perf.
-    // The actual work per nudge is near-zero if no futures are pending.
     set_interval(&cb, 5);
     cb.forget(); // Runs for the lifetime of the worker
 }
