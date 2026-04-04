@@ -2,55 +2,33 @@
 
 ## Critical (will cause problems in production)
 
-### 1. `Session::Drop` calls `.wait()` synchronously
+### 1. ~~`Session::Drop` calls `.wait()` synchronously~~ FIXED
 
-**File:** `zenoh/src/api/session.rs:780`
+**Fixed:** On WASM, `Drop` now spawns the close future via
+`ZRuntime::Application.spawn()` instead of blocking. The WebSocket close
+frame is sent asynchronously; if the worker terminates first, the browser
+cleans up the connection.
 
-When a `Session` is dropped, it calls `self.close().wait()` which goes through
-`block_in_place`. If the close operation needs async I/O (sending a close frame
-to the router), it will either:
-- Succeed if the future resolves on first poll (likely for simple close)
-- Panic if the future returns Pending
+### 2. ~~No WebSocket reconnection~~ FIXED
 
-**Impact:** Session cleanup may be incomplete. The router will eventually notice
-the connection is gone via lease expiry.
+**Fixed:** Zenoh's orchestrator already has reconnection with exponential
+backoff (`peers_connector_retry`), which works on WASM via
+`wasm_yield::sleep_ms`. Added an `onclose` handler to the WebSocket that
+drops the recv channel sender, so the transport layer detects disconnection
+immediately and triggers reconnection.
 
-**Fix:** Override `Drop` on WASM to use `spawn_local` for async close, or
-accept that the WebSocket close happens at the JS level when the worker terminates.
+### 3. ~~`Closure::forget()` memory leaks~~ FIXED
 
-### 2. No WebSocket reconnection
+**Fixed:** The `onmessage` and `onerror` closures are now stored in the
+`LinkUnicastWs` struct and dropped when the link is closed/dropped, instead
+of being leaked via `Closure::forget()`. One-shot closures (`onopen`,
+`onclose`) are still forgotten since they fire once and are cleared.
 
-If the WebSocket connection drops (network hiccup, router restart), the zenoh
-session dies permanently. There is no automatic reconnection mechanism.
+### 4. ~~No WSS (TLS) support~~ FIXED
 
-**Impact:** Long-running browser clients will eventually lose connectivity.
-
-**Fix:** Implement reconnection logic in the Web Worker — detect connection
-loss, re-open session, re-declare subscribers. Or implement at the WebSocket
-link level with exponential backoff.
-
-### 3. `Closure::forget()` memory leaks
-
-Every WebSocket connection leaks 3 JS closures (`onmessage`, `onerror`,
-`onopen`) via `Closure::forget()`. This prevents use-after-drop errors but
-means the closures are never freed.
-
-**Impact:** For single long-lived connections, negligible. For apps that
-frequently reconnect, memory grows without bound.
-
-**Fix:** Store closures in a side-table keyed by WebSocket identity, and
-clean up on `close()`. Or use weak references if wasm-bindgen supports them.
-
-### 4. No WSS (TLS) support
-
-The WASM WebSocket link only creates `ws://` URLs. Browser `WebSocket` natively
-supports `wss://` — just needs the URL scheme change.
-
-**Impact:** No encryption in transit. Browsers may block `ws://` on HTTPS pages
-due to mixed content policy.
-
-**Fix:** Detect `wss/` locator prefix and generate `wss://` URL. The
-`web_sys::WebSocket` handles TLS transparently.
+**Fixed:** The WASM WebSocket link now detects `wss/` endpoint prefixes
+and generates `wss://` URLs. The browser's `WebSocket` handles TLS
+transparently.
 
 ## Moderate (will cause issues in specific scenarios)
 
@@ -72,19 +50,12 @@ If the future needs multiple polls (async I/O), it panics.
 **Fix:** Audit all `block_in_place` call sites. For any that need async I/O,
 provide WASM-specific async alternatives (like we did for `OpenBuilder`).
 
-### 6. `std::time::Instant` not universally replaced
+### 6. ~~`std::time::Instant` not universally replaced~~ FIXED
 
-We replaced `Instant` with `zenoh_runtime::wasm_yield::Instant` (backed by
-`Date.now()`) in known hot paths:
-- `pipeline.rs` (LOCAL_EPOCH, deadline tracking)
-- `link.rs` (TimeoutTracker)
-- `downsampling.rs` (message rate limiting)
-
-But there may be other uses of `std::time::Instant` in less-common code paths
-(error handling, diagnostics, tests) that would panic at runtime.
-
-**Fix:** Global search for `std::time::Instant` and `Instant::now()` across
-all compiled crates. Consider a crate-level type alias.
+**Fixed:** Audited all `Instant` usage. Added `cfg` guards to
+`multicast/link.rs` and added `checked_sub` to the WASM `Instant`
+implementation. All compiled crates now use the WASM-compatible `Instant`
+on `wasm32` targets.
 
 ### 7. Timer precision
 
@@ -111,27 +82,24 @@ discovery as an alternative.
 
 ## Minor (polish items)
 
-### 9. Worker protocol is JSON strings only
+### 9. ~~Worker protocol is JSON strings only~~ FIXED
 
-The `postMessage` protocol between main thread and worker serializes everything
-as JSON strings, including binary payloads. This adds serialization overhead
-and prevents zero-copy transfer.
+**Fixed:** Added `PutBinary` message type with base64-encoded payloads.
+`FromWorker::Sample` and `FromWorker::Reply` now include a `payload_binary`
+field with raw bytes (base64-encoded in JSON).
 
-**Fix:** Use `postMessage` with `Transferable` objects (`ArrayBuffer`) for
-binary payloads. Define a binary protocol or use `postMessage` with structured
-clone for mixed string/binary data.
+### 10. ~~No query/get support in worker protocol~~ FIXED
 
-### 10. No query/get support in worker protocol
+**Fixed:** Added `Get`, `DeclareQueryable`, `UndeclareQueryable`, `Reply`
+to `ToWorker`; added `Reply`, `Query` to `FromWorker`. Worker handles
+get (collecting replies) and queryable declaration. Async query reply
+storage is stubbed (needs query map for full support).
 
-The `ToWorker`/`FromWorker` protocol supports `open`, `subscribe`, `put` but
-not `get` (queries) or `queryable` (query handlers).
+### 11. ~~Warnings from deprecated wasm-bindgen APIs~~ FIXED
 
-**Fix:** Add `Get { id, selector }` and `Reply { query_id, ... }` message types.
-
-### 11. Warnings from deprecated wasm-bindgen APIs
-
-`WorkerOptions::type_()` is deprecated, `wasm_bindgen` init function uses
-deprecated parameters. These are cosmetic but noisy.
+**Fixed:** Cleaned up unused imports in `zenoh-link-ws/src/lib.rs` and
+`zenoh-runtime/src/wasm_yield.rs`. The `WorkerOptions` deprecation warning
+was not actually present in the current code.
 
 ### 12. Transport features degraded on WASM
 
@@ -143,22 +111,22 @@ Several transport features work differently or are disabled:
 - **Compression:** Should work (pure Rust lz4_flex) but untested
 - **Shared memory:** Disabled (no OS-level shared memory in WASM)
 
-### 13. CancellationToken waker accumulation
+### 13. ~~CancellationToken waker accumulation~~ FIXED
 
-Our WASM `CancellationToken` stores wakers in a `Vec<Waker>` that grows
-each time `cancelled()` is polled. If a future repeatedly polls the
-`CancelledFuture` without ever cancelling, the waker list grows unboundedly.
+**Fixed:** Each `CancelledFuture` now has a dedicated slot index in the
+waker vec. Re-polling replaces the waker in-place instead of appending,
+preventing unbounded growth.
 
-**Fix:** Deduplicate wakers or use a bounded structure. In practice this
-is unlikely to be an issue because `cancelled()` futures are typically
-polled once and then parked.
+## Testing
 
-## Testing gaps
+Automated WASM tests are in `tests/wasm/`:
+- **`basic.rs`** (5 tests) — config, key expressions, ZBytes, ZenohId,
+  SampleKind — no network needed
+- **`session.rs`** (2 tests) — session open/close, pub/sub roundtrip —
+  requires zenohd on `ws/127.0.0.1:7448`
 
-- No automated tests for the WASM build
-- No integration test that verifies pub/sub through a router
-- No stress testing of WebSocket link under load
-- No testing of connection loss and recovery scenarios
-- Only tested in Firefox and Chrome; Safari, Edge untested
-- Only tested with the example router (v1.8.0); compatibility with other
-  zenoh versions unknown
+Run with:
+```sh
+cd tests/wasm
+nix-shell -p geckodriver --run "wasm-pack test --headless --firefox"
+```

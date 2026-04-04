@@ -23,14 +23,19 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 
 use async_trait::async_trait;
+#[cfg(not(target_arch = "wasm32"))]
 use url::Url;
 use zenoh_core::zconfigurable;
 use zenoh_link_commons::LocatorInspector;
 use zenoh_protocol::{
-    core::{endpoint::Address, Locator, Metadata, Reliability},
+    core::{Locator, Metadata, Reliability},
     transport::BatchSize,
 };
-use zenoh_result::{bail, ZResult};
+#[cfg(not(target_arch = "wasm32"))]
+use zenoh_protocol::core::endpoint::Address;
+use zenoh_result::ZResult;
+#[cfg(not(target_arch = "wasm32"))]
+use zenoh_result::bail;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod unicast_native;

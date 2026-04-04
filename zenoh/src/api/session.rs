@@ -777,8 +777,23 @@ impl Clone for Session {
 impl Drop for Session {
     fn drop(&mut self) {
         if self.0.strong_counter.fetch_sub(1, Ordering::Relaxed) == 1 {
-            if let Err(error) = self.close().wait() {
-                tracing::error!(error)
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if let Err(error) = self.close().wait() {
+                    tracing::error!(error)
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                // On WASM we can't block, so spawn the close as a fire-and-forget task.
+                // The WebSocket close frame will be sent asynchronously; if the worker
+                // terminates first, the browser cleans up the connection.
+                let close_future = std::future::IntoFuture::into_future(self.close());
+                zenoh_runtime::ZRuntime::Application.spawn(async move {
+                    if let Err(error) = close_future.await {
+                        tracing::error!(%error, "session close error during drop");
+                    }
+                });
             }
         }
     }

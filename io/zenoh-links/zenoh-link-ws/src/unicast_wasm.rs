@@ -49,20 +49,25 @@ pub struct LinkUnicastWs {
     src_locator: Locator,
     dst_locator: Locator,
     leftovers: tokio::sync::Mutex<Option<(Vec<u8>, usize, usize)>>,
+    /// Stored JS closures — dropped on close() to avoid memory leaks.
+    _closures: SendWrapper<Vec<Closure<dyn FnMut(MessageEvent)>>>,
+    _error_closures: SendWrapper<Vec<Closure<dyn FnMut(ErrorEvent)>>>,
 }
 
 
 /// Result of synchronously setting up a WebSocket connection.
 /// All !Send types are already wrapped in SendWrapper.
-/// Closures are forgotten (leaked) to prevent drop issues — they live as long as the WebSocket.
+/// Closures are stored and returned so they can be dropped when the link closes.
 struct WsSetup {
     ws: SendWrapper<WebSocket>,
     recv_rx: flume::Receiver<Vec<u8>>,
     open_rx: flume::Receiver<Result<(), String>>,
+    msg_closures: SendWrapper<Vec<Closure<dyn FnMut(MessageEvent)>>>,
+    err_closures: SendWrapper<Vec<Closure<dyn FnMut(ErrorEvent)>>>,
 }
 
 /// Create and configure WebSocket synchronously (no .await).
-/// Returns only Send-safe types. JS closures are forgotten to avoid drop issues.
+/// Returns only Send-safe types. JS closures are stored in the setup for later cleanup.
 fn setup_ws(url: &str) -> ZResult<WsSetup> {
     let ws = WebSocket::new(url)
         .map_err(|e| zerror!("Failed to create WebSocket to {}: {:?}", url, e))?;
@@ -71,15 +76,14 @@ fn setup_ws(url: &str) -> ZResult<WsSetup> {
     let (recv_tx, recv_rx) = flume::unbounded::<Vec<u8>>();
     let (open_tx, open_rx) = flume::bounded::<Result<(), String>>(1);
 
-    let tx = recv_tx.clone();
+    let msg_tx = recv_tx.clone();
     let on_message = Closure::wrap(Box::new(move |e: MessageEvent| {
         if let Ok(abuf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
             let array = js_sys::Uint8Array::new(&abuf);
-            let _ = tx.send(array.to_vec());
+            let _ = msg_tx.send(array.to_vec());
         }
     }) as Box<dyn FnMut(MessageEvent)>);
     ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    on_message.forget(); // prevent drop — JS holds the reference
 
     let err_tx = open_tx.clone();
     let on_error = Closure::wrap(Box::new(move |e: ErrorEvent| {
@@ -88,18 +92,29 @@ fn setup_ws(url: &str) -> ZResult<WsSetup> {
         let _ = err_tx.send(Err(msg));
     }) as Box<dyn FnMut(ErrorEvent)>);
     ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
-    on_error.forget(); // prevent drop — JS holds the reference
+
+    // Drop recv_tx on close so that read() returns an error promptly,
+    // which triggers the transport layer's reconnection logic.
+    let on_close = Closure::once(move |_: JsValue| {
+        drop(recv_tx);
+        tracing::warn!("WebSocket connection closed by remote");
+    });
+    ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+    on_close.forget(); // one-shot, cleaned up when WS is GC'd
 
     let on_open = Closure::once(move |_: JsValue| {
         let _ = open_tx.send(Ok(()));
     });
     ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
-    on_open.forget(); // prevent drop — JS still holds the reference
+    // on_open is a one-shot — forget it since it's cleared after connection opens
+    on_open.forget();
 
     Ok(WsSetup {
         ws: SendWrapper(ws),
         recv_rx,
         open_rx,
+        msg_closures: SendWrapper(vec![on_message]),
+        err_closures: SendWrapper(vec![on_error]),
     })
 }
 
@@ -129,6 +144,8 @@ impl LinkUnicastWs {
             src_locator,
             dst_locator,
             leftovers: tokio::sync::Mutex::new(None),
+            _closures: setup.msg_closures,
+            _error_closures: setup.err_closures,
         })
     }
 }
@@ -267,7 +284,15 @@ impl LinkManagerUnicastWs {
 impl LinkManagerUnicastTrait for LinkManagerUnicastWs {
     async fn new_link(&self, endpoint: EndPoint) -> ZResult<LinkUnicast> {
         let address = endpoint.address();
-        let url = format!("ws://{}", address);
+        // Support both ws/ and wss/ endpoints.
+        // On WASM, the browser's WebSocket handles TLS transparently for wss:// URLs.
+        let proto = endpoint.protocol();
+        let scheme = if proto.as_str().ends_with("ss") || proto.as_str().ends_with("tls") {
+            "wss"
+        } else {
+            "ws"
+        };
+        let url = format!("{}://{}", scheme, address);
         tracing::debug!("Opening WASM WebSocket connection to {}", url);
         let link = Arc::new(LinkUnicastWs::new(&url).await?);
         Ok(LinkUnicast(link))

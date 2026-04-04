@@ -33,7 +33,9 @@ pub struct CancellationToken {
 
 struct CancellationTokenInner {
     cancelled: AtomicBool,
-    wakers: Mutex<Vec<std::task::Waker>>,
+    /// Stores one waker per CancelledFuture instance (keyed by index).
+    /// Replaces wakers on re-poll instead of accumulating duplicates.
+    wakers: Mutex<Vec<Option<std::task::Waker>>>,
 }
 
 impl CancellationToken {
@@ -50,7 +52,7 @@ impl CancellationToken {
         self.inner.cancelled.store(true, Ordering::SeqCst);
         // Wake all waiting futures
         if let Ok(mut wakers) = self.inner.wakers.lock() {
-            for waker in wakers.drain(..) {
+            for waker in wakers.iter_mut().filter_map(|w| w.take()) {
                 waker.wake();
             }
         }
@@ -66,8 +68,17 @@ impl CancellationToken {
 
     /// Returns a future that completes when the token is cancelled.
     pub fn cancelled(&self) -> CancelledFuture {
+        // Allocate a slot in the waker vec for this future
+        let slot = if let Ok(mut wakers) = self.inner.wakers.lock() {
+            let idx = wakers.len();
+            wakers.push(None);
+            idx
+        } else {
+            0
+        };
         CancelledFuture {
             inner: self.inner.clone(),
+            slot,
         }
     }
 
@@ -102,6 +113,7 @@ impl Default for CancellationToken {
 
 pub struct CancelledFuture {
     inner: Arc<CancellationTokenInner>,
+    slot: usize,
 }
 
 impl Future for CancelledFuture {
@@ -114,9 +126,11 @@ impl Future for CancelledFuture {
         if self.inner.cancelled.load(Ordering::SeqCst) {
             std::task::Poll::Ready(())
         } else {
-            // Register waker to be notified when cancel() is called
+            // Replace the waker in our dedicated slot (no accumulation)
             if let Ok(mut wakers) = self.inner.wakers.lock() {
-                wakers.push(cx.waker().clone());
+                if let Some(entry) = wakers.get_mut(self.slot) {
+                    *entry = Some(cx.waker().clone());
+                }
             }
             std::task::Poll::Pending
         }

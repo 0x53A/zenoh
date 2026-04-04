@@ -4,7 +4,6 @@
 //! to a `Send`-safe future, avoiding the `!Send` JsValue issue.
 
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 
 /// Yield to the browser event loop via `setTimeout(0)`.
 /// Returns a `Send` future safe for use in `tokio::select!` and `async_trait`.
@@ -58,6 +57,10 @@ impl Instant {
 
     pub fn checked_add(&self, duration: std::time::Duration) -> Option<Self> {
         self.0.checked_add(duration.as_millis() as u64).map(Instant)
+    }
+
+    pub fn checked_sub(&self, duration: std::time::Duration) -> Option<Self> {
+        self.0.checked_sub(duration.as_millis() as u64).map(Instant)
     }
 }
 

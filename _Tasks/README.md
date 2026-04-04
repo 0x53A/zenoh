@@ -80,3 +80,8 @@ cargo build -p zenoh
 13. std::time::Instant → WASM-compatible Instant (Date.now)
 14. Async OpenBuilder + client mode on WASM
 15. Keepalive timer for WASM (prevents connection timeout)
+16. Automated WASM tests (basic + session/pub-sub integration)
+17. WSS (TLS) support, closure memory leak fix, Session Drop fix
+18. Instant audit, CancellationToken waker fix, reconnection support
+19. Worker protocol: binary payloads, query/get/queryable support
+20. Unused import cleanup across WASM-compiled crates
