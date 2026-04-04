@@ -19,7 +19,7 @@
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::future::FutureExt;
@@ -28,33 +28,46 @@ use zenoh_runtime::{JoinHandle, ZRuntime};
 /// A simple cancellation token for WASM, API-compatible with tokio_util's CancellationToken.
 #[derive(Clone)]
 pub struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
+    inner: Arc<CancellationTokenInner>,
+}
+
+struct CancellationTokenInner {
+    cancelled: AtomicBool,
+    wakers: Mutex<Vec<std::task::Waker>>,
 }
 
 impl CancellationToken {
     pub fn new() -> Self {
         Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
+            inner: Arc::new(CancellationTokenInner {
+                cancelled: AtomicBool::new(false),
+                wakers: Mutex::new(Vec::new()),
+            }),
         }
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.inner.cancelled.store(true, Ordering::SeqCst);
+        // Wake all waiting futures
+        if let Ok(mut wakers) = self.inner.wakers.lock() {
+            for waker in wakers.drain(..) {
+                waker.wake();
+            }
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.inner.cancelled.load(Ordering::SeqCst)
     }
 
     pub fn child_token(&self) -> CancellationToken {
-        // On WASM, child tokens share the same flag for simplicity
         self.clone()
     }
 
     /// Returns a future that completes when the token is cancelled.
     pub fn cancelled(&self) -> CancelledFuture {
         CancelledFuture {
-            cancelled: self.cancelled.clone(),
+            inner: self.inner.clone(),
         }
     }
 
@@ -63,13 +76,9 @@ impl CancellationToken {
         &self,
         future: F,
     ) -> impl Future<Output = Option<F::Output>> {
-        let cancelled = self.cancelled.clone();
+        let inner = self.inner.clone();
         async move {
-            // Simple poll-based cancellation
-            futures::pin_mut!(future);
-            // We can't truly race without select!, so just run the future
-            // and check cancellation. For WASM single-threaded this is acceptable.
-            if cancelled.load(Ordering::SeqCst) {
+            if inner.cancelled.load(Ordering::SeqCst) {
                 return None;
             }
             Some(future.await)
@@ -77,9 +86,8 @@ impl CancellationToken {
     }
 
     /// Runs a future until this token is cancelled (reference version).
-    /// API-compatible with tokio_util's CancellationToken::run_until_cancelled.
     pub async fn run_until_cancelled<F: Future>(&self, future: F) -> Option<F::Output> {
-        if self.cancelled.load(Ordering::SeqCst) {
+        if self.inner.cancelled.load(Ordering::SeqCst) {
             return None;
         }
         Some(future.await)
@@ -93,7 +101,7 @@ impl Default for CancellationToken {
 }
 
 pub struct CancelledFuture {
-    cancelled: Arc<AtomicBool>,
+    inner: Arc<CancellationTokenInner>,
 }
 
 impl Future for CancelledFuture {
@@ -103,11 +111,13 @@ impl Future for CancelledFuture {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
-        if self.cancelled.load(Ordering::SeqCst) {
+        if self.inner.cancelled.load(Ordering::SeqCst) {
             std::task::Poll::Ready(())
         } else {
-            // Wake again soon to re-check
-            cx.waker().wake_by_ref();
+            // Register waker to be notified when cancel() is called
+            if let Ok(mut wakers) = self.inner.wakers.lock() {
+                wakers.push(cx.waker().clone());
+            }
             std::task::Poll::Pending
         }
     }
