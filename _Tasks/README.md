@@ -87,3 +87,6 @@ cargo build -p zenoh
 20. Unused import cleanup across WASM-compiled crates
 21. SharedArrayBuffer threadpool infrastructure (wasm-threads feature)
 22. Channel-based WebSocket write for thread-safe I/O
+23. Working cross-worker spawn + block_in_place with Condvar
+24. Dedicated I/O worker (Acceptor) for WebSocket — no block_in_place
+25. num_cpus fix, tokio::sync::Mutex for wasm-threads, poll nudge
