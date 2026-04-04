@@ -251,7 +251,13 @@ impl Default for CompressionMulticastConf {
 impl Default for LinkTxConf {
     #[allow(clippy::unnecessary_cast)]
     fn default() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
         let num = 1 + ((num_cpus::get() - 1) / 4);
+        // On WASM, num_cpus may not work correctly (no /proc/cpuinfo, no sysconf).
+        // Use a fixed thread count — the actual concurrency is managed by the
+        // Web Worker pool, not by this config value.
+        #[cfg(target_arch = "wasm32")]
+        let num = 1;
         Self {
             sequence_number_resolution: Bits::from(TransportSn::MAX),
             lease: 10_000,
