@@ -30,13 +30,8 @@ pub async fn run_threaded_test() {
         42u32
     });
     match handle.await {
-        Ok(val) => {
-            if val == 42 {
-                log("  PASS: spawn returned correct value (42)");
-            } else {
-                log(&format!("  FAIL: expected 42, got {val}"));
-            }
-        }
+        Ok(val) if val == 42 => log("  PASS: spawn returned correct value (42)"),
+        Ok(val) => log(&format!("  FAIL: expected 42, got {val}")),
         Err(e) => log(&format!("  FAIL: join error: {e}")),
     }
 
@@ -65,6 +60,59 @@ pub async fn run_threaded_test() {
         Ok(false) => log("  FAIL: config insert failed"),
         Err(e) => log(&format!("  FAIL: {e}")),
     }
+
+    // Test 4: block_in_place with a future that resolves via cross-worker wake.
+    // The future uses a flume channel — the sender fires from another worker,
+    // which wakes the Condvar in block_in_place via the channel's waker.
+    log("Test 4: block_in_place with cross-worker resolution...");
+    let h = zenoh_runtime::ZRuntime::Application.spawn(async {
+        let (tx, rx) = flume::bounded::<u32>(1);
+
+        // Spawn a task on Net worker that sends a value after async delay
+        zenoh_runtime::ZRuntime::Net.spawn(async move {
+            zenoh_runtime::wasm_yield::sleep_ms(100).await;
+            let _ = tx.send(99);
+        });
+
+        // block_in_place: blocks the Application worker's thread via Condvar.
+        // The flume channel's waker calls Condvar::notify when the Net worker
+        // sends the value, unblocking this thread.
+        zenoh_runtime::ZRuntime::Application.block_in_place(async {
+            rx.recv_async().await.unwrap_or(0)
+        })
+    });
+    match h.await {
+        Ok(99) => log("  PASS: block_in_place resolved correctly (99)"),
+        Ok(val) => log(&format!("  FAIL: expected 99, got {val}")),
+        Err(e) => log(&format!("  FAIL: join error: {e}")),
+    }
+
+    // Test 5: zenoh session open (requires zenohd on ws/127.0.0.1:7448)
+    // NOTE: This test currently hangs because zenoh::open() internally spawns
+    // tasks across ZRuntime variants. Cross-worker flume channels work for
+    // JoinHandle (via setTimeout re-poll), but zenoh's internal signaling
+    // (bare channels, Notify, etc.) doesn't have the cross-thread wake
+    // adaptation yet. This will be fixed by adding setTimeout-based wake
+    // to all cross-worker async channels.
+    //
+    // Uncomment to test when cross-worker async signaling is complete:
+    //
+    // log("Test 5: zenoh session open on worker...");
+    // let h = zenoh_runtime::ZRuntime::Application.spawn(async {
+    //     let mut config = zenoh::Config::default();
+    //     config.insert_json5("mode", r#""client""#).unwrap();
+    //     config.insert_json5("connect/endpoints", r#"["ws/127.0.0.1:7448"]"#).unwrap();
+    //     config.insert_json5("scouting/multicast/enabled", "false").unwrap();
+    //     match zenoh::open(config).await {
+    //         Ok(session) => { let zid = session.zid().to_string(); let _ = session.close().await; Some(zid) }
+    //         Err(e) => { web_sys::console::error_1(&JsValue::from_str(&format!("Open error: {e}"))); None }
+    //     }
+    // });
+    // match h.await {
+    //     Ok(Some(zid)) => log(&format!("  PASS: session opened, ZID={zid}")),
+    //     Ok(None) => log("  FAIL: session open returned error (is zenohd running?)"),
+    //     Err(e) => log(&format!("  FAIL: join error: {e}")),
+    // }
 
     log("=== Tests complete ===");
 }
