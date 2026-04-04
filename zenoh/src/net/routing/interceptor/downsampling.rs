@@ -40,6 +40,11 @@ use zenoh_result::ZResult;
 
 use crate::net::routing::interceptor::*;
 
+#[cfg(not(target_arch = "wasm32"))]
+type DownsamplingInstant = std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+type DownsamplingInstant = zenoh_runtime::wasm_yield::Instant;
+
 pub(crate) fn downsampling_interceptor_factories(
     config: &Vec<DownsamplingItemConf>,
 ) -> ZResult<Vec<InterceptorFactory>> {
@@ -205,7 +210,7 @@ impl DownsamplingFilters {
 
 struct TimeState {
     pub threshold: std::time::Duration,
-    pub latest_message_timestamp: Mutex<std::time::Instant>,
+    pub latest_message_timestamp: Mutex<DownsamplingInstant>,
 }
 
 pub(crate) struct DownsamplingInterceptor {
@@ -248,7 +253,7 @@ impl InterceptorTrait for DownsamplingInterceptor {
             return true;
         };
         let mut latest_message_timestamp = zlock!(state.latest_message_timestamp);
-        let timestamp = std::time::Instant::now();
+        let timestamp = DownsamplingInstant::now();
         if timestamp - *latest_message_timestamp >= state.threshold {
             *latest_message_timestamp = timestamp;
             true
@@ -287,7 +292,7 @@ impl DownsamplingInterceptor {
         let mut ke_state = Vec::new();
         for (id, rule) in rules.into_iter().enumerate() {
             let mut threshold = std::time::Duration::MAX;
-            let mut latest_message_timestamp = std::time::Instant::now();
+            let mut latest_message_timestamp = DownsamplingInstant::now();
             if rule.freq != 0.0 {
                 threshold =
                     std::time::Duration::from_nanos((1. / rule.freq * NANOS_PER_SEC) as u64);
