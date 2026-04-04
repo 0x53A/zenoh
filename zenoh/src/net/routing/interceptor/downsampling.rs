@@ -211,7 +211,7 @@ struct Timestate {
 #[cfg(target_arch = "wasm32")]
 struct Timestate {
     pub threshold: std::time::Duration,
-    pub latest_message_timestamp: std::time::Instant,
+    pub latest_message_timestamp: zenoh_runtime::wasm_yield::Instant,
 }
 
 pub(crate) struct DownsamplingInterceptor {
@@ -279,7 +279,7 @@ impl InterceptorTrait for DownsamplingInterceptor {
         #[cfg(not(target_arch = "wasm32"))]
         let timestamp = tokio::time::Instant::now();
         #[cfg(target_arch = "wasm32")]
-        let timestamp = std::time::Instant::now();
+        let timestamp = zenoh_runtime::wasm_yield::Instant::now();
         if timestamp - state.latest_message_timestamp >= state.threshold {
             state.latest_message_timestamp = timestamp;
             true
@@ -322,7 +322,7 @@ impl DownsamplingInterceptor {
             #[cfg(target_arch = "wasm32")]
             let (mut threshold, mut latest_message_timestamp) = (
                 std::time::Duration::from_secs(u64::MAX / 2),
-                std::time::Instant::now(),
+                zenoh_runtime::wasm_yield::Instant::now(),
             );
             if rule.freq != 0.0 {
                 #[cfg(not(target_arch = "wasm32"))]

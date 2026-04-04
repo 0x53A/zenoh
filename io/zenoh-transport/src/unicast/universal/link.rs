@@ -18,8 +18,13 @@ use std::{
         Arc, Mutex, OnceLock,
     },
     task::Poll,
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use zenoh_runtime::wasm_yield::Instant;
 
 use futures::{future::select_all, task::AtomicWaker};
 #[cfg(not(target_arch = "wasm32"))]

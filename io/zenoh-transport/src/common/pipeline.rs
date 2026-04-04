@@ -18,8 +18,13 @@ use std::{
         atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
         Arc, Mutex, MutexGuard,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use zenoh_runtime::wasm_yield::Instant;
 
 use crossbeam_utils::CachePadded;
 use ringbuffer_spsc::{RingBuffer, RingBufferReader, RingBufferWriter};
