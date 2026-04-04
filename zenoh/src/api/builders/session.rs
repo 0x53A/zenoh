@@ -20,6 +20,8 @@ use std::{
 };
 
 use zenoh_core::{Resolvable, Wait};
+#[cfg(target_arch = "wasm32")]
+use crate::net::runtime::RuntimeBuilder;
 #[cfg(feature = "internal")]
 use zenoh_keyexpr::OwnedKeyExpr;
 use zenoh_result::ZResult;
@@ -118,6 +120,7 @@ where
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<TryIntoConfig> IntoFuture for OpenBuilder<TryIntoConfig>
 where
     TryIntoConfig: std::convert::TryInto<crate::config::Config> + Send + 'static,
@@ -128,6 +131,42 @@ where
 
     fn into_future(self) -> Self::IntoFuture {
         std::future::ready(self.wait())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<TryIntoConfig> IntoFuture for OpenBuilder<TryIntoConfig>
+where
+    TryIntoConfig: std::convert::TryInto<crate::config::Config> + Send + 'static,
+    <TryIntoConfig as std::convert::TryInto<crate::config::Config>>::Error: std::fmt::Debug,
+{
+    type Output = <Self as Resolvable>::To;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let config: crate::config::Config = self
+                .config
+                .try_into()
+                .map_err(|e| zerror!("Invalid Zenoh configuration {:?}", &e))?;
+            let aggregated_subscribers = config.0.aggregation().subscribers().clone();
+            let aggregated_publishers = config.0.aggregation().publishers().clone();
+            #[allow(unused_mut)]
+            let mut runtime = RuntimeBuilder::new(config);
+            #[cfg(feature = "shared-memory")]
+            {
+                runtime = runtime.shm_clients(self.shm_clients);
+            }
+            let mut runtime = runtime.build().await?;
+            let session = Session::init(
+                runtime.clone().into(),
+                aggregated_subscribers,
+                aggregated_publishers,
+            )
+            .await;
+            runtime.start().await?;
+            Ok(session)
+        })
     }
 }
 
