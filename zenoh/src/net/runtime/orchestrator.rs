@@ -132,6 +132,7 @@ impl StartConditions {
 }
 
 impl Runtime {
+    #[cfg(not(target_arch = "wasm32"))]
     fn warn_if_oneof(peer_group: &EndPoints) {
         if let EndPoints::Locators(group) = peer_group {
             if matches!(group.strategy, LocatorsStrategy::OneOf) {
@@ -248,7 +249,12 @@ impl Runtime {
         if peers.is_empty() {
             bail!("No peer specified and multicast scouting is not available on WASM!")
         } else {
-            self.connect_peers(&peers, true).await
+            for peer_group in &peers {
+                for endpoint in peer_group.as_vec() {
+                    self.peer_connector(endpoint).await;
+                }
+            }
+            Ok(())
         }
     }
 
@@ -310,7 +316,11 @@ impl Runtime {
         };
 
         self.bind_listeners(&listeners).await?;
-        self.connect_peers(&peers, false).await?;
+        for peer_group in &peers {
+            for endpoint in peer_group.as_vec() {
+                self.peer_connector(endpoint).await;
+            }
+        }
         Ok(())
     }
 
@@ -373,7 +383,11 @@ impl Runtime {
         };
 
         self.bind_listeners(&listeners).await?;
-        self.connect_peers(&peers, false).await?;
+        for peer_group in &peers {
+            for endpoint in peer_group.as_vec() {
+                self.peer_connector(endpoint).await;
+            }
+        }
         Ok(())
     }
 
@@ -429,6 +443,7 @@ impl Runtime {
         Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn connect_peers(&self, peers: &[EndPoints], single_link: bool) -> ZResult<()> {
         let timeout = self.get_global_connect_timeout();
         if timeout.is_zero() {
@@ -457,6 +472,7 @@ impl Runtime {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn connect_peers_impl(&self, peers: &[EndPoints], single_link: bool) -> ZResult<()> {
         if single_link {
             self.connect_peers_single_link(peers).await
@@ -465,6 +481,7 @@ impl Runtime {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn connect_peers_single_link(&self, peers: &[EndPoints]) -> ZResult<()> {
         let mut success_flag = false;
         for peer_group in peers {
@@ -514,6 +531,7 @@ impl Runtime {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn connect_peers_multiply_links(&self, peers: &[EndPoints]) -> ZResult<()> {
         for peer_group in peers {
             Self::warn_if_oneof(peer_group);

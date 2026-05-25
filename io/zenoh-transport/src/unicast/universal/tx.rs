@@ -157,7 +157,7 @@ impl TransportUnicastUniversal {
         #[cfg(feature = "stats")]
         let stats = transport_link.stats.clone();
 
-        #[cfg(feature = "unstable")]
+        #[cfg(all(feature = "unstable", not(target_arch = "wasm32")))]
         if msg.congestion_control() == CongestionControl::BlockFirst {
             let priority = msg.priority();
             if transport_link.block_first_waiters[priority as usize]

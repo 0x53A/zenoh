@@ -401,7 +401,7 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastWs {
         let url = format!("{}://{}", scheme, address);
         tracing::debug!("Opening WASM WebSocket connection to {}", url);
         let link = Arc::new(LinkUnicastWs::new(&url).await?);
-        Ok(LinkUnicast(link))
+        Ok(LinkUnicast(zenoh_link_commons::NewLink::Single(link)))
     }
 
     async fn new_listener(&self, _endpoint: EndPoint) -> ZResult<Locator> {

@@ -115,10 +115,11 @@ impl<StartArgs: PluginStartArgs, Instance: PluginInstance> fmt::Debug
     for PluginsManager<StartArgs, Instance>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PluginsManager")
-            .field("default_lib_prefix", &self.default_lib_prefix)
-            .field("loader", &self.loader.as_ref().map(|_| ".."))
-            .field("plugins_len", &self.plugins.len())
+        let mut s = f.debug_struct("PluginsManager");
+        s.field("default_lib_prefix", &self.default_lib_prefix);
+        #[cfg(not(target_arch = "wasm32"))]
+        s.field("loader", &self.loader.as_ref().map(|_| ".."));
+        s.field("plugins_len", &self.plugins.len())
             .finish()
     }
 }
