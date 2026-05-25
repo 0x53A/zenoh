@@ -438,6 +438,7 @@ impl<'a> AdvancedPublisher<'a> {
             None
         };
 
+        #[cfg(not(target_arch = "wasm32"))]
         let state_publisher = if let Some((period, sporadic)) =
             conf.miss_config.as_ref().and_then(|c| c.state_publisher)
         {
@@ -491,6 +492,8 @@ impl<'a> AdvancedPublisher<'a> {
         } else {
             None
         };
+        #[cfg(target_arch = "wasm32")]
+        let state_publisher: Option<zenoh::internal::TerminatableTask> = None;
 
         Ok(AdvancedPublisher {
             publisher,

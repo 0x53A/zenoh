@@ -261,6 +261,14 @@ pub struct TerminatableTask {
     token: CancellationToken,
 }
 
+impl std::fmt::Debug for TerminatableTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminatableTask")
+            .field("is_cancelled", &self.token.is_cancelled())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Drop for TerminatableTask {
     fn drop(&mut self) {
         // On WASM, we just cancel — can't block waiting

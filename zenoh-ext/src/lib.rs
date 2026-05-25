@@ -42,7 +42,7 @@ mod advanced_cache;
 mod advanced_publisher;
 #[cfg(feature = "unstable")]
 mod advanced_subscriber;
-#[cfg(feature = "unstable")]
+#[cfg(all(feature = "unstable", not(target_arch = "wasm32")))]
 pub mod group;
 #[cfg(feature = "unstable")]
 mod publication_cache;

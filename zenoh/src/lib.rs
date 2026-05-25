@@ -1041,9 +1041,9 @@ pub mod internal {
     pub use zenoh_result::bail;
     pub use zenoh_sync::Condition;
     pub use zenoh_task::{TaskController, TerminatableTask};
-    pub use zenoh_util::{
-        zenoh_home, LibLoader, Timed, TimedEvent, TimedHandle, Timer, ZENOH_HOME_ENV_VAR,
-    };
+    pub use zenoh_util::ZENOH_HOME_ENV_VAR;
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use zenoh_util::{zenoh_home, LibLoader, Timed, TimedEvent, TimedHandle, Timer};
 
     /// A collection of useful buffers used by Zenoh internally and exposed to the user to facilitate
     /// reading and writing data.

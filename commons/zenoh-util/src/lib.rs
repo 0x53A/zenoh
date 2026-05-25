@@ -33,6 +33,10 @@ pub use lib_loader::*;
 pub mod timer;
 #[cfg(not(target_arch = "wasm32"))]
 pub use timer::*;
+#[cfg(target_arch = "wasm32")]
+mod timer_wasm;
+#[cfg(target_arch = "wasm32")]
+pub use timer_wasm::*;
 pub mod log;
 pub use lib_search_dirs::*;
 pub use log::*;
