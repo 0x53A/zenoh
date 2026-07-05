@@ -36,10 +36,23 @@ verified (see `ros-z-wasm/examples/wasm-demo-threaded/`).
   phase by phase, with rationale for each design decision
 - [KNOWN_ISSUES.md](KNOWN_ISSUES.md) — Known issues, weaknesses, and
   testing gaps with severity levels and fix suggestions
-- [THREADPOOL_ARCHITECTURE.md](THREADPOOL_ARCHITECTURE.md) — Design for
-  pure-Rust threadpool (SharedArrayBuffer workers with custom executor)
+- [THREADPOOL_ARCHITECTURE.md](THREADPOOL_ARCHITECTURE.md) — Design +
+  implementation status of the pure-Rust threadpool (SharedArrayBuffer
+  workers with custom executor)
 
-## Quick start
+## Choosing a mode
+
+- **Single-threaded (default):** stable toolchain, no COOP/COEP headers,
+  works everywhere — but it is an audited async-only subset: anything that
+  would truly block panics (`block_in_place` single-poll), some features are
+  skipped (e.g. hiroz graph liveliness), and hidden-tab timer throttling can
+  drop the session lease (KNOWN_ISSUES #14).
+- **Multi-threaded (`wasm-threads` feature):** the full programming model —
+  real blocking on workers, sync API without per-call-site audits, transport
+  off the main thread, throttle-proof `Atomics.wait` timers. Requires
+  nightly + build-std and a cross-origin-isolated page (COOP/COEP).
+
+## Quick start (single-threaded)
 
 ```sh
 # Build the router
@@ -60,6 +73,21 @@ python -m http.server 8080
 # Send a message from CLI
 cargo run --example z_put -- -e ws/127.0.0.1:7448 -k demo/example/test -p "Hello"
 ```
+
+## Quick start (multi-threaded)
+
+```sh
+# Router as above, then:
+cd examples/wasm-threaded
+./build.sh              # nightly + build-std; flags in .cargo/config.toml
+python3 serve.py 8082 & # COOP/COEP headers (SharedArrayBuffer requirement)
+node run_headless.mjs   # automated 6/6, or open http://localhost:8082
+```
+
+hiroz (ros-z) demos incl. ROS 2 Jazzy interop:
+`../ros-z-wasm/examples/wasm-demo/` (single-threaded, wasm-pack tests) and
+`../ros-z-wasm/examples/wasm-demo-threaded/` (threaded, interactive page +
+headless runner).
 
 ## Architecture
 

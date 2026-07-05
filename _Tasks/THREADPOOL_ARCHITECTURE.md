@@ -367,30 +367,26 @@ File: `commons/zenoh-runtime/src/wasm_threaded.rs`
 - **WebSocket link architecture**: already correct (channels + I/O dispatch).
 - **`Date.now()` for Instant**: kept — it's a synchronous FFI call.
 
-## Current File State (as of last session)
+## Current File State (post-implementation, 2026-07-06)
 
 Key files and their roles — read these first when picking up:
 
 | File | Role | State |
 |------|------|-------|
-| `commons/zenoh-runtime/src/lib.rs` | Feature-gates `wasm.rs` vs `wasm_threaded.rs` | Done |
+| `commons/zenoh-runtime/src/lib.rs` | Feature-gates `wasm.rs` vs `executor.rs`+`wasm_threaded.rs` | Done |
 | `commons/zenoh-runtime/src/wasm.rs` | Single-threaded WASM runtime (default, no feature) | Stable, working |
-| `commons/zenoh-runtime/src/wasm_threaded.rs` | Multi-threaded runtime — **needs LocalExecutor** | Has workers, spawn, block_in_place with Condvar, poll nudge hacks |
-| `commons/zenoh-runtime/src/wasm_yield.rs` | sleep/yield (JS setTimeout) + Instant (Date.now) | Needs pure-Rust sleep for workers |
+| `commons/zenoh-runtime/src/executor.rs` | LocalExecutor: Condvar wakers, timer queue, block_on/run | Done |
+| `commons/zenoh-runtime/src/wasm_threaded.rs` | Threaded runtime: executor on compute workers, Acceptor on JS loop, `spawn_on_current`, `recv_async_anywhere`, setTimeout self-repoll for JS threads | Done |
+| `commons/zenoh-runtime/src/wasm_yield.rs` | sleep/yield: executor timer queue on compute workers, setTimeout on JS threads; Instant (Date.now) | Done |
 | `commons/zenoh-runtime/src/compat.rs` | AsyncMutex/RwLock platform aliases | Done (tokio::sync for wasm-threads) |
-| `commons/zenoh-runtime/Cargo.toml` | Deps + `wasm-threads` feature | Done |
-| `commons/zenoh-task/src/wasm.rs` | CancellationToken + TaskController | Has Send bounds, works |
-| `commons/zenoh-config/src/defaults.rs` | num_cpus fix for WASM | Done |
-| `io/zenoh-links/zenoh-link-ws/src/unicast_wasm.rs` | WebSocket link (channel-based I/O) | Done — dispatches WS to Acceptor, has cross_worker_recv hack (remove in Phase 5) |
-| `io/zenoh-links/zenoh-link-ws/src/lib.rs` | Link protocol, cfg gates | Done |
-| `io/zenoh-transport/src/unicast/universal/link.rs` | Keep-alive timeout tracker | Uses spawn_local + sleep_ms — needs executor.spawn + CondvarSleep |
-| `io/zenoh-transport/src/common/pipeline.rs` | TX pipeline yield | Uses yield_now — needs executor.yield_now |
-| `zenoh/src/net/runtime/mod.rs` | RuntimeTransportEventHandler | Fixed north_bound_transport_peer_count (blocking lock) |
-| `zenoh/src/api/session.rs` | Session Drop (spawn on WASM) | Done |
-| `zenoh/src/api/builders/session.rs` | WASM-specific async OpenBuilder | Done |
-| `examples/wasm-threaded/` | Standalone test page with COEP server | 4/5 tests pass, Test 5 (session open) blocked on executor |
+| `commons/zenoh-task/src/wasm.rs` | CancellationToken + TaskController (routes via ZRuntime::spawn) | Done |
+| `io/zenoh-links/zenoh-link-ws/src/unicast_wasm.rs` | WebSocket link: I/O on Acceptor, `recv_async_anywhere` everywhere, SAB-safe send (copies to non-shared buffer) | Done |
+| `io/zenoh-transport/src/unicast/universal/link.rs` | Keep-alive timeout tracker via `spawn_on_current` + sleep_ms | Done |
+| `io/zenoh-transport/src/common/pipeline.rs` | TX pipeline yield (executor-aware yield_now) | Done |
+| `examples/wasm-threaded/` | Standalone test page with COEP server + headless Chrome runner | 6/6 pass (incl. session open + pub/sub roundtrip) |
 | `examples/wasm-client/` | Original single-threaded example | Working |
-| `tests/wasm/` | Automated wasm-pack tests | 7/7 pass (non-threaded) |
+| `tests/wasm/` | Automated wasm-pack tests (non-threaded) | 7/7 pass |
+| `ros-z-wasm/examples/wasm-demo-threaded/` | hiroz on wasm-threads ↔ ROS 2 Jazzy | 3/3 pass, bidirectional |
 
 ### Build configurations
 
@@ -409,26 +405,24 @@ cargo build -p zenoh
 # Run standard WASM tests
 cd tests/wasm && nix-shell -p geckodriver --run "wasm-pack test --headless --firefox"
 
-# Run threaded tests (needs COEP server + zenohd)
-cd examples/wasm-threaded && python3 serve.py  # port 8081
-# Then open http://localhost:8081 in Chrome (needs COOP/COEP headers)
+# Run threaded tests headless (needs COEP server + zenohd)
+cd examples/wasm-threaded
+./build.sh                                    # cargo build + wasm-bindgen 0.2.117
+python3 serve.py 8082 &                       # COOP/COEP headers
+../../target/release/zenohd -l ws/127.0.0.1:7448 &
+node run_headless.mjs                         # 6/6 expected
 ```
 
-### Git log (recent, most relevant first)
+### Git log (implementation milestones, most recent first)
 
 ```
+d18c6aee8 docs: hiroz verified on wasm-threads (bidirectional ROS 2 interop)
+23a0e7611 wasm32: pure-Rust LocalExecutor on compute workers + SAB-safe WebSocket send
+62e430397..2863fcaf1 Merge WASM support onto zenoh 1.9.0 (+fixes)
 6510fbd docs: pure-Rust threadpool architecture for WASM workers
 2a37d16 wasm32: cross-worker waker registry + I/O dispatch improvements
 6220889 wasm32: dispatch WebSocket I/O to dedicated Acceptor worker
-a51a7f0 wasm32: AsyncMutex → tokio::sync for wasm-threads
-89836717 wasm32: fix north_bound_transport_peer_count + timeout block_in_place
-91d7bc14 wasm32: poll nudge for cross-worker wake + session open investigation
-6e2886b0 wasm32: block_in_place works + num_cpus fix
-d31cde38 wasm32: fix Config::default() hang on workers
-4dc6bdeb wasm32: working cross-worker spawn with SharedArrayBuffer
-1e34759f wasm32: channel-based WebSocket write for thread safety
-474d0074 wasm32: SharedArrayBuffer threadpool — infrastructure + skeleton
-3c9334b5 wasm32: fix all known issues + add automated WASM tests
+474d0074..a51a7f0 SharedArrayBuffer threadpool infrastructure
 ```
 
 ## Risk Assessment

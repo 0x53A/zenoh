@@ -122,7 +122,22 @@ Several transport features work differently or are disabled:
 waker vec. Re-polling replaces the waker in-place instead of appending,
 preventing unbounded growth.
 
-### 14. SharedArrayBuffer-backed views rejected by some JS APIs (wasm-threads)
+### 14. Background-tab timer throttling can drop the session (single-threaded)
+
+Single-threaded mode runs keepalives on `setTimeout`. Browsers throttle
+timers in hidden tabs (Chrome's intensive throttling: chained timers fire
+about once per minute after a few minutes in the background). With the
+default 4s keep-alive / 10s lease, a backgrounded tab will likely miss its
+lease and get disconnected; reconnection then only happens when the tab is
+foregrounded again.
+
+`wasm-threads` largely avoids this: dedicated workers are throttled far
+less, and the compute workers' timers are `Atomics.wait`-based (executor
+timer queue), which browsers do not throttle. **Untested so far** — verify
+backgrounded-tab behavior explicitly in both modes (candidate for the
+benchmark session).
+
+### 15. SharedArrayBuffer-backed views rejected by some JS APIs (wasm-threads)
 
 With `+atomics`, WASM linear memory is a SharedArrayBuffer. Several browser
 APIs throw a TypeError when handed a view of it: `WebSocket.send()`,
@@ -138,14 +153,29 @@ when adding new web-sys calls on the wasm-threads path**, and never discard
 
 ## Testing
 
-Automated WASM tests are in `tests/wasm/`:
+**Single-threaded** (`tests/wasm/`, wasm-pack + Firefox):
 - **`basic.rs`** (5 tests) — config, key expressions, ZBytes, ZenohId,
   SampleKind — no network needed
 - **`session.rs`** (2 tests) — session open/close, pub/sub roundtrip —
   requires zenohd on `ws/127.0.0.1:7448`
 
-Run with:
 ```sh
 cd tests/wasm
 nix-shell -p geckodriver --run "wasm-pack test --headless --firefox"
 ```
+
+**Multi-threaded** (`examples/wasm-threaded/`, headless Chrome — wasm-pack
+can't serve the COOP/COEP headers SharedArrayBuffer needs):
+- 6 tests: cross-worker spawn, multi-runtime spawn, config on worker,
+  block_in_place with cross-worker wake, session open, pub/sub roundtrip
+
+```sh
+cd examples/wasm-threaded
+./build.sh && python3 serve.py 8082 &
+../../target/release/zenohd -l ws/127.0.0.1:7448 &
+node run_headless.mjs
+```
+
+**hiroz / ROS 2 interop** (in `ros-z-wasm/examples/`):
+- `wasm-demo/` — single-threaded, wasm-pack tests incl. e2e vs ROS 2 Jazzy
+- `wasm-demo-threaded/` — threaded, headless Chrome, bidirectional /chatter

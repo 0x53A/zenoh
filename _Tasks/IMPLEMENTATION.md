@@ -2,9 +2,13 @@
 
 ## Overview
 
-This document describes the approach taken to port Eclipse Zenoh (v1.8.0) from
-a native Rust library to compile and run on `wasm32-unknown-unknown`, targeting
-browser environments via Web Workers and WebSocket transport.
+This document describes the approach taken to port Eclipse Zenoh (originally
+v1.8.0, since rebased onto v1.9.0) from a native Rust library to compile and
+run on `wasm32-unknown-unknown`, targeting browser environments via Web
+Workers and WebSocket transport.
+
+The phases below cover the single-threaded port; the closing sections cover
+the 1.9.0 rebase and the multi-threaded runtime.
 
 The work was done bottom-up, starting from leaf crates with no platform
 dependencies and working up through the dependency tree to the main `zenoh`
@@ -263,3 +267,56 @@ the worker, but the worker needs time to load WASM and set up its `onmessage`
 handler. Solution: the worker bootstrap JS sets up a temporary message buffer
 before loading WASM, then replays buffered messages after `start_worker()`
 has registered its handler.
+
+## Rebase onto zenoh 1.9.0 (2026)
+
+The WASM branch was merged onto upstream `release/1.9.0` (`2863fcaf1` +
+three fix commits). Notable knock-on changes: `zenoh-ext` gates tokio
+`io-std` behind non-WASM, `BlockFirst` congestion control gated in
+`unicast/tx.rs`, misc API renames. Native and WASM test suites were
+re-verified after the merge.
+
+## Multi-threaded runtime (wasm-threads feature)
+
+Design and implementation status live in
+[THREADPOOL_ARCHITECTURE.md](THREADPOOL_ARCHITECTURE.md). Summary of what
+shipped (2026-07-06):
+
+- **`executor.rs` — LocalExecutor.** A single-threaded, manually pumpable
+  async executor per compute worker (Application, TX, RX, Net). Wakers are
+  `Arc<Condvar>`-backed and compile to `memory.atomic.notify`, so waking
+  works from any thread sharing the WASM memory. Includes a timer queue for
+  pure-Rust `sleep_ms`. `block_in_place` delegates to `executor.block_on`,
+  which pumps the worker's other tasks between waits — tokio semantics.
+- **Worker split.** Compute workers block their thread in `executor.run()`
+  forever; no JS runs there afterwards (any `setTimeout`/`spawn_local` on
+  those threads would never fire — that's why sleep/yield/keep-alive were
+  moved to executor primitives). The Acceptor keeps its JS event loop for
+  WebSocket callbacks; its receives from cross-thread channels self-repoll
+  via `setTimeout(1)` (`recv_async_anywhere`) instead of trusting
+  cross-thread microtask wakes.
+- **SharedArrayBuffer pitfall.** `WebSocket.send()` (and several other
+  browser APIs) reject views backed by shared memory. wasm-bindgen passes
+  `&[u8]` as views of WASM memory — under `+atomics` that's an SAB. The
+  write loop now copies outgoing frames into a fresh non-shared
+  `Uint8Array` first. This silent TypeError was the second root cause of
+  the historic "session open hangs in threaded mode".
+- **Build requirements.** Nightly + `-Zbuild-std`, target features
+  `+atomics,+bulk-memory,+mutable-globals`, shared/imported memory link
+  args, and `--export=__heap_base` (newer wasm-ld stopped exporting it;
+  wasm-bindgen's threading pass needs it). Pages must be cross-origin
+  isolated (COOP/COEP) for SharedArrayBuffer.
+
+### Which mode to use
+
+- **Single-threaded (default):** no special toolchain, no COOP/COEP, works
+  everywhere — but it is an *audited async-only subset*. `block_in_place`
+  panics if a future actually needs to wait; blocking API surface was
+  either given async WASM variants (`zenoh::open`, hiroz `build_async`) or
+  skipped (hiroz graph liveliness query). Timers ride on `setTimeout`, so
+  aggressive browser throttling of hidden tabs can drop the transport lease.
+- **Multi-threaded (`wasm-threads`):** full programming model —
+  `block_in_place` genuinely blocks on workers, sync API works without
+  per-call-site audits, transport runs off the main thread, and compute
+  workers use `Atomics.wait`-based timers that browsers don't throttle.
+  Costs: nightly build-std toolchain and cross-origin isolation headers.
