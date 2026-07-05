@@ -24,8 +24,11 @@ Two bugs had caused the historic "session open hangs":
    buffer in `unicast_wasm.rs`. (Single-threaded builds have non-shared memory,
    which is why they always worked.)
 
-**Next step:** Threaded mode in a real app — e.g. build hiroz (ros-z) against
-the `wasm-threads` feature, and benchmark threaded vs single-threaded throughput.
+**hiroz on threads (2026-07-06):** hiroz (ros-z) builds and runs against
+`wasm-threads` — bidirectional browser ↔ ROS 2 Jazzy interop via rmw_zenoh
+verified (see `ros-z-wasm/examples/wasm-demo-threaded/`).
+
+**Next step:** benchmark threaded vs single-threaded throughput/latency.
 
 ## Documentation
 
