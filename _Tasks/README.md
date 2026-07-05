@@ -89,7 +89,7 @@ hiroz (ros-z) demos incl. ROS 2 Jazzy interop:
 `../ros-z-wasm/examples/wasm-demo-threaded/` (threaded, interactive page +
 headless runner).
 
-## Architecture
+## Architecture (single-threaded example)
 
 ```
 Browser Tab                     Server
@@ -99,11 +99,16 @@ Browser Tab                     Server
 |   postMessage ◄──┼──────────┼── WebSocket ──────┤
 |                  |           |                  |
 | Web Worker       |           |  (optional)      |
-|   start_worker() |           | zenoh-plugin-    |
-|   zenoh session  |           |   ros2dds        |
-|   transport      |           |     ↕ DDS        |
+|   start_worker() |           |  ROS 2 nodes via |
+|   zenoh session  |           |  rmw_zenoh_cpp   |
+|   transport      |           |  (proven e2e)    |
 +------------------+           +------------------+
 ```
+
+In the multi-threaded mode there is no postMessage protocol: the zenoh
+session lives on SharedArrayBuffer workers inside the same tab, and the main
+thread talks to it through shared-memory channels (see
+`examples/wasm-threaded/` and THREADPOOL_ARCHITECTURE.md).
 
 ## Build commands
 
