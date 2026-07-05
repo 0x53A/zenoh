@@ -2,8 +2,10 @@ use wasm_bindgen::prelude::*;
 
 /// Test entry point — called from the HTML page.
 /// Initializes the threaded runtime and runs basic tests.
+/// `endpoint` is the zenoh router endpoint for tests 5/6,
+/// e.g. "ws/127.0.0.1:7448" or "wss/host:443".
 #[wasm_bindgen]
-pub async fn run_threaded_test() {
+pub async fn run_threaded_test(endpoint: String) {
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("PANIC: {}", info);
         web_sys::console::error_1(&JsValue::from_str(&msg));
@@ -96,13 +98,14 @@ pub async fn run_threaded_test() {
         Err(e) => log(&format!("  FAIL: join error: {e}")),
     }
 
-    // Test 5: zenoh session open (requires zenohd on ws/127.0.0.1:7448)
-    log("Test 5: zenoh session open on worker...");
-    let h = zenoh_runtime::ZRuntime::Application.spawn(async {
+    // Test 5: zenoh session open (requires zenohd on the given endpoint)
+    log(&format!("Test 5: zenoh session open on worker ({endpoint})..."));
+    let ep = endpoint.clone();
+    let h = zenoh_runtime::ZRuntime::Application.spawn(async move {
         web_sys::console::log_1(&JsValue::from_str("[test5] creating config..."));
         let mut config = zenoh::Config::default();
         config.insert_json5("mode", r#""client""#).unwrap();
-        config.insert_json5("connect/endpoints", r#"["ws/127.0.0.1:7448"]"#).unwrap();
+        config.insert_json5("connect/endpoints", &format!(r#"["{ep}"]"#)).unwrap();
         config.insert_json5("scouting/multicast/enabled", "false").unwrap();
         web_sys::console::log_1(&JsValue::from_str("[test5] calling zenoh::open()..."));
         match zenoh::open(config).await {
@@ -119,16 +122,17 @@ pub async fn run_threaded_test() {
     });
     match h.await {
         Ok(Some(zid)) => log(&format!("  PASS: session opened, ZID={zid}")),
-        Ok(None) => log("  FAIL: session open returned error (is zenohd running on ws/127.0.0.1:7448?)"),
+        Ok(None) => log(&format!("  FAIL: session open returned error (is zenohd running on {endpoint}?)")),
         Err(e) => log(&format!("  FAIL: join error: {e}")),
     }
 
     // Test 6: pub/sub roundtrip through the router (requires zenohd)
     log("Test 6: pub/sub roundtrip on workers...");
-    let h = zenoh_runtime::ZRuntime::Application.spawn(async {
+    let ep = endpoint.clone();
+    let h = zenoh_runtime::ZRuntime::Application.spawn(async move {
         let mut config = zenoh::Config::default();
         config.insert_json5("mode", r#""client""#).unwrap();
-        config.insert_json5("connect/endpoints", r#"["ws/127.0.0.1:7448"]"#).unwrap();
+        config.insert_json5("connect/endpoints", &format!(r#"["{ep}"]"#)).unwrap();
         config.insert_json5("scouting/multicast/enabled", "false").unwrap();
         let session = match zenoh::open(config).await {
             Ok(s) => s,

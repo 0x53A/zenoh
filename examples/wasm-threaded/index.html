@@ -8,21 +8,40 @@
     #output p { margin: 2px 0; }
     .fail { color: #f00; }
     .pass { color: #0f0; }
+    input { background: #000; color: #0f0; border: 1px solid #0f0;
+            padding: 4px 8px; font-family: inherit; width: 20rem; }
+    button { background: #0f0; color: #000; border: 0; padding: 4px 12px;
+             font-family: inherit; font-weight: bold; cursor: pointer; }
+    button:disabled { background: #333; color: #666; }
+    .hint { color: #060; font-size: 0.8em; }
   </style>
 </head>
 <body>
   <h2>Zenoh WASM Threaded Runtime Test</h2>
+  <p>
+    <input id="endpoint" value="ws/127.0.0.1:7448" placeholder="zenoh router endpoint">
+    <button id="run">run tests</button>
+  </p>
+  <p class="hint">
+    format: ws/host:port or wss/host:port — from an https page, plain ws/
+    only works for 127.0.0.1/localhost; remote routers need wss/.
+    Tests 1–4 run offline; tests 5–6 need a zenoh router on the endpoint.
+  </p>
   <div id="output"></div>
   <script src="./pkg/zenoh_wasm_threaded_test.js"></script>
   <script>
-    async function run() {
-      await wasm_bindgen('./pkg/zenoh_wasm_threaded_test_bg.wasm');
-      wasm_bindgen.run_threaded_test();
-    }
-    run().catch(e => {
-      document.getElementById('output').innerHTML += '<p class="fail">Fatal: ' + e + '</p>';
-      console.error(e);
-    });
+    const ready = wasm_bindgen('./pkg/zenoh_wasm_threaded_test_bg.wasm');
+    document.getElementById('run').onclick = async () => {
+      document.getElementById('run').disabled = true;
+      document.getElementById('endpoint').disabled = true;
+      try {
+        await ready;
+        await wasm_bindgen.run_threaded_test(document.getElementById('endpoint').value.trim());
+      } catch (e) {
+        document.getElementById('output').innerHTML += '<p class="fail">Fatal: ' + e + '</p>';
+        console.error(e);
+      }
+    };
   </script>
 </body>
 </html>
