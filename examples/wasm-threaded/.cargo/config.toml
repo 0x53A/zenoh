@@ -9,6 +9,9 @@ rustflags = [
   '-Clink-arg=--export=__tls_size',
   '-Clink-arg=--export=__tls_align',
   '-Clink-arg=--export=__tls_base',
+  # wasm-bindgen's threading pass needs __heap_base to inject per-thread
+  # stack/TLS allocation; newer wasm-ld no longer exports it by default.
+  '-Clink-arg=--export=__heap_base',
 ]
 
 [unstable]

@@ -10,6 +10,15 @@ pub async fn run_threaded_test() {
         log(&msg);
     }));
 
+    // Route zenoh's tracing output to the browser console (workers included).
+    // Raise to DEBUG/TRACE when diagnosing transport issues.
+    tracing_wasm::set_as_global_default_with_config(
+        tracing_wasm::WASMLayerConfigBuilder::new()
+            .set_max_level(tracing::Level::INFO)
+            .set_console_config(tracing_wasm::ConsoleConfig::ReportWithoutConsoleColor)
+            .build(),
+    );
+
     log("=== Zenoh WASM Threaded Runtime Test ===");
 
     // Initialize the threaded runtime with the shim URL
@@ -111,6 +120,45 @@ pub async fn run_threaded_test() {
     match h.await {
         Ok(Some(zid)) => log(&format!("  PASS: session opened, ZID={zid}")),
         Ok(None) => log("  FAIL: session open returned error (is zenohd running on ws/127.0.0.1:7448?)"),
+        Err(e) => log(&format!("  FAIL: join error: {e}")),
+    }
+
+    // Test 6: pub/sub roundtrip through the router (requires zenohd)
+    log("Test 6: pub/sub roundtrip on workers...");
+    let h = zenoh_runtime::ZRuntime::Application.spawn(async {
+        let mut config = zenoh::Config::default();
+        config.insert_json5("mode", r#""client""#).unwrap();
+        config.insert_json5("connect/endpoints", r#"["ws/127.0.0.1:7448"]"#).unwrap();
+        config.insert_json5("scouting/multicast/enabled", "false").unwrap();
+        let session = match zenoh::open(config).await {
+            Ok(s) => s,
+            Err(e) => return Err(format!("open: {e}")),
+        };
+        let sub = match session.declare_subscriber("wasm/threaded/roundtrip").await {
+            Ok(s) => s,
+            Err(e) => return Err(format!("subscriber: {e}")),
+        };
+        // Give the router a moment to propagate the subscription
+        zenoh_runtime::wasm_yield::sleep_ms(500).await;
+        if let Err(e) = session.put("wasm/threaded/roundtrip", "ping-from-worker").await {
+            return Err(format!("put: {e}"));
+        }
+        let sample = match sub.recv_async().await {
+            Ok(s) => s,
+            Err(e) => return Err(format!("recv: {e}")),
+        };
+        let payload = sample
+            .payload()
+            .try_to_string()
+            .map(|s| s.into_owned())
+            .unwrap_or_default();
+        let _ = session.close().await;
+        Ok(payload)
+    });
+    match h.await {
+        Ok(Ok(p)) if p == "ping-from-worker" => log("  PASS: pub/sub roundtrip delivered payload"),
+        Ok(Ok(p)) => log(&format!("  FAIL: wrong payload: {p}")),
+        Ok(Err(e)) => log(&format!("  FAIL: {e}")),
         Err(e) => log(&format!("  FAIL: join error: {e}")),
     }
 

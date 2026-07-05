@@ -1,5 +1,18 @@
 # WASM Threadpool Architecture: Pure-Rust Workers
 
+> **STATUS: IMPLEMENTED (2026-07-06).** All phases done; threaded tests pass
+> 6/6 including session open and pub/sub roundtrip. Deviations from this plan:
+> - The Acceptor's channel receive loops use setTimeout-based self-repolling
+>   (`recv_async_anywhere` in zenoh-runtime) instead of a global waker
+>   registry/poll nudge — same effect, no global state.
+> - A second, independent bug was uncovered once the executor worked:
+>   `WebSocket.send()` throws on SharedArrayBuffer-backed views; the write
+>   loop swallowed the error. Fix: copy outgoing frames into a fresh
+>   non-shared `Uint8Array` (unicast_wasm.rs).
+> - `-Clink-arg=--export=__heap_base` is required in `.cargo/config.toml` —
+>   newer wasm-ld stopped exporting it and wasm-bindgen's threading pass
+>   needs it.
+
 ## Problem Statement
 
 The current `wasm-threads` implementation uses `wasm_bindgen_futures::spawn_local`

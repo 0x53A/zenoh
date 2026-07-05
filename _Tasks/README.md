@@ -3,19 +3,29 @@
 Port of Eclipse Zenoh to `wasm32-unknown-unknown` with WebSocket transport,
 enabling browser-based zenoh clients via Web Workers.
 
-## Status: Working prototype + threadpool in progress
+## Status: Both modes working (single- and multi-threaded), zenoh 1.9.0
 
 **Single-threaded (default):** Pub/sub works end-to-end: browser ↔ router ↔ CLI.
 7 automated tests pass (5 basic + 2 session with router).
 
 **Multi-threaded (`wasm-threads` feature):** SharedArrayBuffer Web Workers with
-shared WASM memory. 4/5 tests pass (cross-worker spawn, multi-runtime, config,
-block_in_place with Condvar). Session open hangs because workers use
-`spawn_local` (JS microtask queue) which can't be pumped from `block_in_place`.
+shared WASM memory — **6/6 tests pass including session open and a full pub/sub
+roundtrip through the router.** Compute workers (app/tx/rx/net) run a pure-Rust
+`LocalExecutor` (Condvar-backed wakers, pumped by `block_in_place`); only the
+main thread and the Acceptor (I/O) worker keep a JS event loop. See
+[THREADPOOL_ARCHITECTURE.md](THREADPOOL_ARCHITECTURE.md) — implemented 2026-07-06.
 
-**Next step:** Replace `spawn_local` on threadpool workers with a pure-Rust
-`LocalExecutor` that `block_in_place` can pump. See
-[THREADPOOL_ARCHITECTURE.md](THREADPOOL_ARCHITECTURE.md) for the full plan.
+Two bugs had caused the historic "session open hangs":
+1. Workers used `spawn_local` (JS microtask queue), unpumpable from
+   `block_in_place` and unwakeable across workers → fixed by the LocalExecutor.
+2. `WebSocket.send()` rejects SharedArrayBuffer-backed views with a TypeError
+   that the write loop silently discarded (`let _ =`), so no zenoh frame ever
+   hit the wire in threaded mode. Fixed by copying into a fresh non-shared
+   buffer in `unicast_wasm.rs`. (Single-threaded builds have non-shared memory,
+   which is why they always worked.)
+
+**Next step:** Threaded mode in a real app — e.g. build hiroz (ros-z) against
+the `wasm-threads` feature, and benchmark threaded vs single-threaded throughput.
 
 ## Documentation
 
@@ -101,3 +111,7 @@ cargo build -p zenoh
 23. Working cross-worker spawn + block_in_place with Condvar
 24. Dedicated I/O worker (Acceptor) for WebSocket — no block_in_place
 25. num_cpus fix, tokio::sync::Mutex for wasm-threads, poll nudge
+26. Merge onto zenoh 1.9.0 + compilation fixes (4 commits)
+27. LocalExecutor wired into compute workers; executor-based sleep/yield;
+    poll-nudge/waker-registry hacks removed; SAB-safe WebSocket.send —
+    threaded session open + pub/sub roundtrip pass (6/6)

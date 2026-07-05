@@ -170,8 +170,24 @@ impl ZRuntime {
     }
 }
 
-/// No-op on single-threaded WASM — cross-worker waking isn't needed.
-pub fn register_cross_worker_waker(_waker: &std::task::Waker) {}
+/// Single-threaded WASM never has a LocalExecutor (that's a wasm-threads concept).
+pub fn has_local_executor() -> bool {
+    false
+}
+
+/// Spawn a `!Send` future on the current thread's JS microtask queue.
+/// (On wasm-threads compute workers this targets the LocalExecutor instead.)
+pub fn spawn_on_current<F: Future<Output = ()> + 'static>(f: F) {
+    wasm_bindgen_futures::spawn_local(f);
+}
+
+/// Receive from a flume channel. Single-threaded WASM: plain `recv_async`,
+/// same-thread wakes always work. (Cross-thread variant lives in wasm_threaded.)
+pub async fn recv_async_anywhere<T: Send + 'static>(
+    rx: &flume::Receiver<T>,
+) -> Result<T, flume::RecvError> {
+    rx.recv_async().await
+}
 
 // A runtime guard — no-op on WASM
 pub struct ZRuntimePoolGuard;

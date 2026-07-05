@@ -568,10 +568,12 @@ impl TimeoutTracker {
             has_timed_out: AtomicBool::new(false),
             latest_reset: Mutex::new(now),
         });
-        // On WASM, use a spawn_local + sleep_ms loop for timeout tracking
+        // On WASM, use an async sleep_ms loop for timeout tracking. spawn_on_current
+        // targets the LocalExecutor on compute workers (where setTimeout/spawn_local
+        // would never fire) and the JS microtask queue elsewhere.
         let tracker = Arc::downgrade(&inner);
         let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
-        wasm_bindgen_futures::spawn_local(async move {
+        zenoh_runtime::spawn_on_current(async move {
             let mut latest_reset = now;
             loop {
                 zenoh_runtime::wasm_yield::sleep_ms(timeout_ms).await;

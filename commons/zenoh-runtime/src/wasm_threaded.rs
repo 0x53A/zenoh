@@ -100,6 +100,9 @@ impl ZRuntime {
 /// A handle to a spawned task, API-compatible with tokio's JoinHandle.
 pub struct JoinHandle<T> {
     rx: flume::Receiver<T>,
+    /// Persistent recv future so the flume waker registration survives
+    /// across polls (recreating it each poll would deregister the waker on drop).
+    fut: Option<Pin<Box<dyn Future<Output = Result<T, flume::RecvError>> + Send + Sync>>>,
 }
 
 impl<T> std::fmt::Debug for JoinHandle<T> {
@@ -108,54 +111,53 @@ impl<T> std::fmt::Debug for JoinHandle<T> {
     }
 }
 
-impl<T> Future for JoinHandle<T> {
+impl<T: Send + 'static> Future for JoinHandle<T> {
     type Output = Result<T, JoinError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.rx.try_recv() {
-            Ok(val) => Poll::Ready(Ok(val)),
-            Err(flume::TryRecvError::Empty) => {
-                if THREADED_MODE.load(Ordering::Acquire) {
-                    // In threaded mode, the result may arrive from another worker.
-                    // JS wakers are per-thread (spawn_local uses microtasks), so a
-                    // waker from worker A can't schedule a re-poll on worker B.
-                    // Solution: use setTimeout(0) to re-poll on this thread's event loop.
-                    let waker = cx.waker().clone();
-                    schedule_waker_repoll(waker);
-                    Poll::Pending
-                } else {
-                    // Single-threaded: use flume's async recv which works on one thread.
-                    let rx = self.rx.clone();
-                    let mut fut = Box::pin(async move { rx.recv_async().await });
-                    match fut.as_mut().poll(cx) {
-                        Poll::Ready(Ok(val)) => Poll::Ready(Ok(val)),
-                        Poll::Ready(Err(_)) => Poll::Ready(Err(JoinError)),
-                        Poll::Pending => Poll::Pending,
-                    }
-                }
-            }
-            Err(flume::TryRecvError::Disconnected) => Poll::Ready(Err(JoinError)),
+        let this = self.get_mut();
+        match this.rx.try_recv() {
+            Ok(val) => return Poll::Ready(Ok(val)),
+            Err(flume::TryRecvError::Disconnected) => return Poll::Ready(Err(JoinError)),
+            Err(flume::TryRecvError::Empty) => {}
+        }
+        if THREADED_MODE.load(Ordering::Acquire) && !has_local_executor() {
+            // JS thread (main or Acceptor) in threaded mode: the result arrives
+            // from another worker, whose flume wake can't reach this thread's
+            // microtask queue. Self-repoll via setTimeout.
+            schedule_waker_repoll(cx.waker().clone());
+            return Poll::Pending;
+        }
+        // Compute worker (Condvar-backed waker, cross-thread safe) or
+        // single-threaded fallback (same-thread wakes work).
+        let rx = this.rx.clone();
+        let fut = this
+            .fut
+            .get_or_insert_with(|| Box::pin(rx.into_recv_async()));
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(Ok(val)) => Poll::Ready(Ok(val)),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(JoinError)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 /// Schedule a waker to fire after yielding to the JS event loop.
-/// Uses `setTimeout(0)` (~4ms in browsers) to re-poll on the current thread.
-/// This bridges the gap between cross-worker flume channels and per-thread
-/// JS event loops.
+/// Uses `setTimeout(1)` (browsers clamp to ~1-4ms) to re-poll on the current
+/// thread. This bridges cross-worker flume channels and per-thread JS event
+/// loops. `once_into_js` hands ownership to JS — freed after the call, no leak.
 fn schedule_waker_repoll(waker: std::task::Waker) {
     use wasm_bindgen::closure::Closure;
-    let cb = Closure::once(move || {
+    let cb = Closure::once_into_js(move || {
         waker.wake();
     });
-    set_timeout(&cb, 1);
-    cb.forget(); // One-shot, leaked — acceptable for waker re-polls
+    set_timeout(cb.unchecked_ref(), 1);
 }
 
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_name = "setTimeout")]
-    fn set_timeout(closure: &Closure<dyn FnMut()>, millis: i32);
+    fn set_timeout(f: &js_sys::Function, millis: i32);
 }
 
 
@@ -231,8 +233,17 @@ static WORKERS_READY: AtomicU32 = AtomicU32::new(0);
 static TASK_RECEIVERS: OnceLock<Vec<flume::Receiver<BoxedTask>>> = OnceLock::new();
 
 /// Entry point called by each Web Worker after WASM module is initialized
-/// with shared memory. The worker runs a `spawn_local` event loop that
-/// drains its task channel.
+/// with shared memory.
+///
+/// Compute workers (Application, TX, RX, Net) run a pure-Rust [`LocalExecutor`]
+/// that blocks the worker thread forever. Their futures are woken via
+/// `Condvar::notify` (`memory.atomic.notify`), which works from any thread.
+/// No JS is used on these workers after entry — `setTimeout`/`spawn_local`
+/// would never fire since the event loop is permanently blocked.
+///
+/// The Acceptor (I/O worker) keeps its JS event loop alive for WebSocket
+/// callbacks. Its task drain uses setTimeout-based self-repolling, since
+/// JS microtask wakers cannot be triggered reliably from other threads.
 #[wasm_bindgen]
 pub fn __zenoh_worker_entry(variant_id: u32) {
     let receivers = TASK_RECEIVERS.get().expect("Task receivers not initialized");
@@ -241,71 +252,72 @@ pub fn __zenoh_worker_entry(variant_id: u32) {
     // Signal that this worker is ready
     WORKERS_READY.fetch_add(1, Ordering::Release);
 
-    // Start a periodic nudge (setInterval) that re-polls pending spawn_local futures.
-    // This is necessary because cross-worker wakes (e.g., flume tx.send() from
-    // worker A calling a waker registered on worker B) use queueMicrotask which
-    // is thread-local. The nudge ensures pending futures on this worker get
-    // re-polled even when their waker was called from another worker.
-    start_poll_nudge();
-
-    // Run the task drain loop on this worker's JS event loop.
-    wasm_bindgen_futures::spawn_local(async move {
-        loop {
-            match rx.recv_async().await {
-                Ok(task) => task(),
-                Err(_) => break, // Channel closed — pool shutting down
+    if variant_id == ZRuntime::Acceptor.variant_id() as u32 {
+        // I/O worker: JS event loop stays alive for WebSocket callbacks.
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                match recv_async_anywhere(&rx).await {
+                    Ok(task) => task(),
+                    Err(_) => break, // Channel closed — pool shutting down
+                }
             }
-        }
-    });
-}
-
-/// Global waker registry for cross-worker wake bridging.
-/// Each worker registers wakers of pending futures here. The poll nudge
-/// wakes ALL registered wakers, forcing the wasm_bindgen_futures executor
-/// to re-poll them.
-static WAKER_REGISTRY: Mutex<Vec<std::task::Waker>> = Mutex::new(Vec::new());
-
-/// Register a waker in the global registry for cross-worker nudging.
-pub fn register_cross_worker_waker(waker: &std::task::Waker) {
-    if let Ok(mut registry) = WAKER_REGISTRY.lock() {
-        // Replace existing waker for this thread or add new one.
-        // We keep a bounded set to avoid unbounded growth.
-        if registry.len() >= 64 {
-            // Compact: remove stale entries by waking and re-adding
-            let old = std::mem::take(&mut *registry);
-            for w in old {
-                w.wake();
+        });
+    } else {
+        // Compute worker: pure-Rust executor owns this thread from here on.
+        let executor = std::rc::Rc::new(crate::executor::LocalExecutor::new());
+        executor.install();
+        executor.spawn(async move {
+            loop {
+                // flume's waker is our executor's Condvar-backed waker here,
+                // so sends from any thread wake this loop.
+                match rx.recv_async().await {
+                    Ok(task) => task(),
+                    Err(_) => break,
+                }
             }
-        }
-        registry.push(waker.clone());
+        });
+        executor.run();
     }
 }
 
-/// Start a setInterval that periodically wakes ALL registered futures.
-/// This bridges cross-worker async channels where the waker was called
-/// from the wrong thread's microtask queue.
-fn start_poll_nudge() {
-    use wasm_bindgen::closure::Closure;
+pub use crate::executor::has_local_executor;
 
-    let cb = Closure::wrap(Box::new(|| {
-        // Wake all registered wakers — this forces the executor to re-poll
-        // pending futures that may have been woken from other workers.
-        if let Ok(mut registry) = WAKER_REGISTRY.lock() {
-            for waker in registry.drain(..) {
-                waker.wake();
-            }
-        }
-    }) as Box<dyn FnMut()>);
-
-    // 5ms interval — frequent enough for responsiveness, light enough for perf.
-    set_interval(&cb, 5);
-    cb.forget(); // Runs for the lifetime of the worker
+/// Spawn a `!Send` future on the current thread: onto the thread's
+/// [`LocalExecutor`] on compute workers, or the JS microtask queue on the
+/// main thread / Acceptor.
+pub fn spawn_on_current<F: Future<Output = ()> + 'static>(f: F) {
+    if let Some(exec) = crate::executor::try_current_executor() {
+        exec.spawn(f);
+    } else {
+        wasm_bindgen_futures::spawn_local(f);
+    }
 }
 
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_name = "setInterval")]
-    fn set_interval(closure: &Closure<dyn FnMut()>, millis: i32);
+/// Receive from a flume channel, working correctly regardless of which
+/// thread runs the future and which thread the sender fires from.
+///
+/// - Compute workers: plain `recv_async` — the executor's wakers are
+///   Condvar-backed and cross-thread safe.
+/// - Main thread / Acceptor in threaded mode: senders on other threads can't
+///   wake a JS microtask waker, so self-repoll via `setTimeout(1)`.
+/// - Threaded mode inactive (single-threaded fallback): plain `recv_async` —
+///   everything is on one thread.
+pub async fn recv_async_anywhere<T: Send + 'static>(
+    rx: &flume::Receiver<T>,
+) -> Result<T, flume::RecvError> {
+    let needs_repoll = THREADED_MODE.load(Ordering::Acquire) && !has_local_executor();
+    if !needs_repoll {
+        return rx.recv_async().await;
+    }
+    std::future::poll_fn(|cx| match rx.try_recv() {
+        Ok(v) => Poll::Ready(Ok(v)),
+        Err(flume::TryRecvError::Disconnected) => Poll::Ready(Err(flume::RecvError::Disconnected)),
+        Err(flume::TryRecvError::Empty) => {
+            schedule_waker_repoll(cx.waker().clone());
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 /// URL of the wasm-bindgen JS shim. Set during init, read by workers.
@@ -484,11 +496,13 @@ impl ZRuntime {
         let (tx, rx) = flume::bounded(1);
 
         if THREADED_MODE.load(Ordering::Acquire) {
-            // Dispatch to the worker for this runtime variant
+            // Dispatch to the worker for this runtime variant. The closure runs
+            // ON the target worker: compute workers spawn onto their
+            // LocalExecutor, the Acceptor onto its JS microtask queue.
             let pool = WORKER_POOL.get().expect("Worker pool not initialized");
             let worker = pool.get(self);
             let task: BoxedTask = Box::new(move || {
-                wasm_bindgen_futures::spawn_local(async move {
+                spawn_on_current(async move {
                     let result = future.await;
                     let _ = tx.send(result);
                 });
@@ -505,7 +519,7 @@ impl ZRuntime {
             });
         }
 
-        JoinHandle { rx }
+        JoinHandle { rx, fut: None }
     }
 
     /// Block the current worker until the future completes.
@@ -548,7 +562,15 @@ impl ZRuntime {
             }
         }
 
-        // Threaded mode: real blocking via Condvar with periodic timeout.
+        // Compute worker: block on the LocalExecutor, which pumps this worker's
+        // other tasks between polls (matching tokio's block_in_place semantics).
+        // Progress made by those tasks can produce the value we're blocked on.
+        if let Some(exec) = crate::executor::try_current_executor() {
+            return exec.block_on(f);
+        }
+
+        // Threaded mode on a JS thread (should only be the Acceptor; the main
+        // thread cannot block): Condvar wait with periodic timeout.
         // The timeout ensures we re-poll even if a waker notification was missed
         // (e.g., waker called between poll returning Pending and entering wait).
         let mut f = std::pin::pin!(f);

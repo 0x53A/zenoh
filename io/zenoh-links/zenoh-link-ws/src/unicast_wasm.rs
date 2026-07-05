@@ -30,45 +30,6 @@ use zenoh_result::{bail, zerror, ZResult};
 
 use super::{WS_DEFAULT_MTU, WS_LOCATOR_PREFIX};
 
-/// Receive from a flume channel with cross-worker wake support.
-/// Registers the waker in the global nudge registry so that the periodic
-/// setInterval can wake this future even when the sender is on another worker.
-async fn cross_worker_recv<T: Send + 'static>(rx: flume::Receiver<T>) -> Result<T, flume::RecvError> {
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-
-    struct CrossWorkerRecv<T: Send + 'static> {
-        rx: flume::Receiver<T>,
-        inner: Option<Pin<Box<dyn Future<Output = Result<T, flume::RecvError>> + Send>>>,
-    }
-
-    impl<T: Send + 'static> Future for CrossWorkerRecv<T> {
-        type Output = Result<T, flume::RecvError>;
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            // Try non-blocking receive first
-            match self.rx.try_recv() {
-                Ok(val) => return Poll::Ready(Ok(val)),
-                Err(flume::TryRecvError::Disconnected) => {
-                    return Poll::Ready(Err(flume::RecvError::Disconnected))
-                }
-                Err(flume::TryRecvError::Empty) => {}
-            }
-            // Register waker for cross-worker nudging
-            zenoh_runtime::register_cross_worker_waker(cx.waker());
-            // Poll the inner async recv
-            if self.inner.is_none() {
-                let rx = self.rx.clone();
-                self.inner = Some(Box::pin(async move { rx.recv_async().await }));
-            }
-            self.inner.as_mut().unwrap().as_mut().poll(cx)
-        }
-    }
-
-    CrossWorkerRecv { rx, inner: None }.await
-}
-
 /// Wrapper to make JsValue-based types Send+Sync on WASM.
 /// SAFETY: With shared-memory workers, the wrapped JS object is thread-affine —
 /// only accessed from the worker that created it. The write_tx channel ensures
@@ -163,10 +124,20 @@ fn setup_ws(url: &str) -> ZResult<WsSetup> {
     let (write_tx, write_rx) = flume::unbounded::<WriteCmd>();
     let ws_for_write = SendWrapper(ws.clone());
     wasm_bindgen_futures::spawn_local(async move {
-        while let Ok(cmd) = write_rx.recv_async().await {
+        // Senders are on compute workers — recv_async_anywhere self-repolls
+        // via setTimeout on this (Acceptor) thread instead of relying on
+        // cross-thread microtask wakes.
+        while let Ok(cmd) = zenoh_runtime::recv_async_anywhere(&write_rx).await {
             match cmd {
                 WriteCmd::Send(data) => {
-                    let _ = ws_for_write.send_with_u8_array(&data);
+                    // With +atomics the WASM linear memory is a SharedArrayBuffer,
+                    // and WebSocket.send() rejects SAB-backed views with a TypeError.
+                    // Copy into a fresh (non-shared) buffer before sending.
+                    let array = js_sys::Uint8Array::new_with_length(data.len() as u32);
+                    array.copy_from(&data);
+                    if let Err(e) = ws_for_write.send_with_array_buffer(&array.buffer()) {
+                        tracing::error!("WebSocket send failed: {:?}", e);
+                    }
                 }
                 WriteCmd::Close => {
                     ws_for_write.set_onmessage(None);
@@ -217,7 +188,7 @@ impl LinkUnicastWs {
             };
 
             // Wait for connection to open (on the Acceptor worker's event loop)
-            match setup.open_rx.recv_async().await {
+            match zenoh_runtime::recv_async_anywhere(&setup.open_rx).await {
                 Ok(Ok(())) => {
                     let _ = result_tx.send(Ok((setup.write_tx, setup.recv_rx)));
                 }
@@ -235,12 +206,14 @@ impl LinkUnicastWs {
             // The close_rx channel blocks this task until close_tx is dropped.
             let _closures = setup.msg_closures;
             let _err_closures = setup.err_closures;
-            let _ = close_rx.recv_async().await;
+            // close_tx is dropped from another worker — needs the repoll-based recv.
+            let _ = zenoh_runtime::recv_async_anywhere(&close_rx).await;
         });
 
         // Wait for the Acceptor worker to establish the connection.
-        // Use a polling loop with waker registration for cross-worker wake.
-        let (write_tx, recv_rx) = cross_worker_recv(result_rx)
+        // recv_async_anywhere handles the cross-worker wake for every caller
+        // thread (compute worker executor waker, or setTimeout repoll on JS threads).
+        let (write_tx, recv_rx) = zenoh_runtime::recv_async_anywhere(&result_rx)
             .await
             .map_err(|e| zerror!("I/O worker channel closed: {}", e))?
             .map_err(|e| zerror!("{}", e))?;
@@ -287,9 +260,8 @@ impl LinkUnicastTrait for LinkUnicastWs {
         let (slice, start, len) = match leftovers_guard.take() {
             Some(tuple) => tuple,
             None => {
-                let data = self
-                    .recv_rx
-                    .recv_async()
+                // Sender is the Acceptor's onmessage callback (another thread).
+                let data = zenoh_runtime::recv_async_anywhere(&self.recv_rx)
                     .await
                     .map_err(|e| zerror!("Read error on WebSocket link {}: {}", self, e))?;
                 let len = data.len();

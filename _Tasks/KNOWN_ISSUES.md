@@ -32,9 +32,14 @@ transparently.
 
 ## Moderate (will cause issues in specific scenarios)
 
-### 5. `block_in_place` single-poll limitation
+### 5. `block_in_place` single-poll limitation (single-threaded mode only)
 
-`ZRuntime::block_in_place` on WASM polls the future exactly once with a noop
+With `wasm-threads`, `block_in_place` on compute workers now blocks properly:
+it delegates to the worker's `LocalExecutor::block_on`, which pumps the
+worker's other tasks between Condvar waits (matching tokio semantics).
+
+In single-threaded mode (default), the old limitation remains:
+`ZRuntime::block_in_place` polls the future exactly once with a noop
 waker. If the future resolves immediately (synchronous operations), it works.
 If the future needs multiple polls (async I/O), it panics.
 
@@ -116,6 +121,20 @@ Several transport features work differently or are disabled:
 **Fixed:** Each `CancelledFuture` now has a dedicated slot index in the
 waker vec. Re-polling replaces the waker in-place instead of appending,
 preventing unbounded growth.
+
+### 14. SharedArrayBuffer-backed views rejected by some JS APIs (wasm-threads)
+
+With `+atomics`, WASM linear memory is a SharedArrayBuffer. Several browser
+APIs throw a TypeError when handed a view of it: `WebSocket.send()`,
+`postMessage` (non-transfer), `fetch` bodies, `TextDecoder.decode`,
+`crypto.getRandomValues`. wasm-bindgen's `&[u8]` marshalling passes such
+views (`getUint8ArrayMemory0().subarray(...)`).
+
+Fixed for `WebSocket.send()` in `unicast_wasm.rs` (copy into a fresh
+non-shared `Uint8Array` first) — this silent TypeError was one of the two
+root causes of the threaded session-open hang. **Watch for the same pattern
+when adding new web-sys calls on the wasm-threads path**, and never discard
+`Result`s from web-sys send/write APIs.
 
 ## Testing
 
