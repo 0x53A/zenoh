@@ -3,6 +3,9 @@
 <head>
   <meta charset="utf-8">
   <title>Zenoh WASM Threaded Runtime Test</title>
+  <!-- COOP/COEP shim for hosts that can't send the headers (e.g. GitHub Pages);
+       no-op when the server already provides cross-origin isolation -->
+  <script src="coi-serviceworker.js"></script>
   <style>
     body { font-family: monospace; background: #111; color: #0f0; padding: 20px; }
     #output p { margin: 2px 0; }
