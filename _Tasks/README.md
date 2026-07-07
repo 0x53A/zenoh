@@ -52,63 +52,33 @@ verified (see `ros-z-wasm/examples/wasm-demo-threaded/`).
   off the main thread, throttle-proof `Atomics.wait` timers. Requires
   nightly + build-std and a cross-origin-isolated page (COOP/COEP).
 
-## Quick start (single-threaded)
-
-```sh
-# Build the router
-cargo build --release -p zenohd
-
-# Start router with WebSocket transport
-./target/release/zenohd -l ws/0.0.0.0:7448
-
-# Build the WASM example
-cd examples/wasm-client
-wasm-pack build --target no-modules --dev
-
-# Serve the page
-python -m http.server 8080
-
-# Open http://localhost:8080 in a browser
-
-# Send a message from CLI
-cargo run --example z_put -- -e ws/127.0.0.1:7448 -k demo/example/test -p "Hello"
-```
+The single-threaded example (`examples/wasm-client`) was removed — the mode
+still compiles (default, without the `wasm-threads` feature), but only the
+multi-threaded example is maintained and demoed.
 
 ## Quick start (multi-threaded)
 
 ```sh
-# Router as above, then:
+# Build and start the router
+cargo build --release -p zenohd
+./target/release/zenohd -l ws/0.0.0.0:7448
+
 cd examples/wasm-threaded
 ./build.sh              # nightly + build-std; flags in .cargo/config.toml
 python3 serve.py 8082 & # COOP/COEP headers (SharedArrayBuffer requirement)
 node run_headless.mjs   # automated 6/6, or open http://localhost:8082
 ```
 
-hiroz (ros-z) demos incl. ROS 2 Jazzy interop:
-`../ros-z-wasm/examples/wasm-demo/` (single-threaded, wasm-pack tests) and
-`../ros-z-wasm/examples/wasm-demo-threaded/` (threaded, interactive page +
-headless runner).
+hiroz (ros-z) demo incl. ROS 2 Jazzy interop (threaded, interactive page +
+headless runner + docker stack): `../ros-z-wasm/examples/wasm-demo/`.
 
-## Architecture (single-threaded example)
+## Architecture
 
-```
-Browser Tab                     Server
-+------------------+           +------------------+
-| Main Thread (UI) |           |                  |
-|   start_main()   |           |     zenohd       |
-|   postMessage ◄──┼──────────┼── WebSocket ──────┤
-|                  |           |                  |
-| Web Worker       |           |  (optional)      |
-|   start_worker() |           |  ROS 2 nodes via |
-|   zenoh session  |           |  rmw_zenoh_cpp   |
-|   transport      |           |  (proven e2e)    |
-+------------------+           +------------------+
-```
-
-In the multi-threaded mode there is no postMessage protocol: the zenoh
-session lives on SharedArrayBuffer workers inside the same tab, and the main
-thread talks to it through shared-memory channels (see
-`examples/wasm-threaded/` and THREADPOOL_ARCHITECTURE.md).
+The zenoh session lives on SharedArrayBuffer workers inside the tab, and the
+main thread talks to it through shared-memory channels (see
+`examples/wasm-threaded/` and THREADPOOL_ARCHITECTURE.md). The server side is
+plain `zenohd` with the ws transport, optionally with ROS 2 nodes attached
+via rmw_zenoh_cpp (proven e2e).
 
 ## Build commands
 
