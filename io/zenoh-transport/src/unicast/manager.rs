@@ -889,7 +889,10 @@ impl TransportManager {
         {
             tokio::time::timeout(self.config.unicast.open_timeout, async {
                 match manager.new_link(endpoint.clone()).await {
-                    Ok(link) => super::establishment::open::open_link(endpoint, link, self).await,
+                    Ok(link) => {
+                        super::establishment::open::open_link(endpoint, link, self, expected_zid)
+                            .await
+                    }
                     Err(e) => Err(e),
                 }
             })

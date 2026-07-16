@@ -17,6 +17,7 @@ use std::{
 };
 
 use lru::LruCache;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio_util::task::AbortOnDropHandle;
 use zenoh::{
     config::ZenohId,
@@ -53,6 +54,16 @@ use crate::{
     utils::WrappingSn,
     z_deserialize,
 };
+
+#[cfg(target_arch = "wasm32")]
+struct AbortOnDropHandle<T>(std::marker::PhantomData<T>);
+
+#[cfg(target_arch = "wasm32")]
+impl<T> AbortOnDropHandle<T> {
+    fn new<Handle>(_handle: Handle) -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 /// Configure query for historical data for [`history`](crate::AdvancedSubscriberBuilder::history) method.

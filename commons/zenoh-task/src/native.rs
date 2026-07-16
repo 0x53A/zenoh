@@ -27,6 +27,15 @@ pub struct TaskController {
     token: CancellationToken,
 }
 
+impl std::fmt::Debug for TaskController {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskController")
+            .field("is_closed", &self.tracker.is_closed())
+            .field("is_cancelled", &self.token.is_cancelled())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for TaskController {
     fn default() -> Self {
         TaskController {

@@ -39,14 +39,9 @@ leb128 = { workspace = true }
 lru = { workspace = true }
 serde = { workspace = true, features = ["default"] }
 tokio = { workspace = true, features = [
-  "sync",
-] }
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { workspace = true, features = [
-  "io-std",
   "macros",
   "rt",
+  "sync",
   "time",
 ] }
 tokio-util = { workspace = true }
@@ -55,6 +50,11 @@ uhlc = { workspace = true }
 zenoh = { workspace = true, default-features = false }
 zenoh-macros = { workspace = true }
 zenoh-util = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = [
+  "io-std",
+] }
 
 [dev-dependencies]
 rand = { workspace = true }

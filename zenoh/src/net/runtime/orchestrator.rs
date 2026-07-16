@@ -44,7 +44,7 @@ use zenoh_protocol::core::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use zenoh_protocol::{
-    core::{whatami::WhatAmIMatcher, EndPoints, LocatorsStrategy},
+    core::whatami::WhatAmIMatcher,
     scouting::{HelloProto, Scout, ScoutingBody, ScoutingMessage},
 };
 use zenoh_result::{bail, zerror, ZResult};
