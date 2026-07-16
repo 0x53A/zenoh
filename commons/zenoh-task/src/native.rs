@@ -127,6 +127,14 @@ pub struct TerminatableTask {
     token: CancellationToken,
 }
 
+impl std::fmt::Debug for TerminatableTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminatableTask")
+            .field("is_finished", &self.handle.as_ref().is_none_or(|h| h.is_finished()))
+            .finish_non_exhaustive()
+    }
+}
+
 impl Drop for TerminatableTask {
     fn drop(&mut self) {
         self.terminate(std::time::Duration::from_secs(10));
