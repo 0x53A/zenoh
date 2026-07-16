@@ -13,14 +13,11 @@
 //
 
 //! To manage groups and group memberships
-use std::{
-    collections::HashMap,
-    convert::TryInto,
-    fmt,
-    ops::Add,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+use std::{collections::HashMap, convert::TryInto, fmt, ops::Add, sync::Arc, time::Duration};
+#[cfg(target_arch = "wasm32")]
+use zenoh_runtime::wasm_yield::Instant;
 
 use flume::{Receiver, Sender};
 use futures::{prelude::*, select};

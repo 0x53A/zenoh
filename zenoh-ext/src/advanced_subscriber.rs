@@ -11,10 +11,13 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 use std::{
     cmp::min, collections::BTreeMap, fmt, future::IntoFuture, hash::Hash, str::FromStr, sync::Weak,
-    time::Instant,
 };
+#[cfg(target_arch = "wasm32")]
+use zenoh_runtime::wasm_yield::Instant;
 
 use lru::LruCache;
 #[cfg(not(target_arch = "wasm32"))]
@@ -822,14 +825,14 @@ async fn gc_task(statesref: Weak<Mutex<State>>, retention_period: Duration) {
         now
     }
     // start by sleeping for the initial retention period
-    tokio::time::sleep(retention_period).await;
+    sleep_duration(retention_period).await;
     loop {
         let oldest_access = {
             let Some(states) = statesref.upgrade() else {
                 // either the task was scheduled concurrently to its abortion, so we don't care
                 // sleeping, or we are in the theoretically possible but zero probability case
                 // of `new_cyclic` not having returned yet, so we still don't care sleeping.
-                tokio::time::sleep(retention_period).await;
+                sleep_duration(retention_period).await;
                 continue;
             };
             let mut states = states.lock().unwrap();
@@ -839,8 +842,30 @@ async fn gc_task(statesref: Weak<Mutex<State>>, retention_period: Duration) {
                 garbage_collect(&mut states.timestamped_states, retention_period, now),
             )
         };
-        tokio::time::sleep_until((oldest_access + retention_period).into()).await;
+        sleep_until_instant(oldest_access + retention_period).await;
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn sleep_until_instant(instant: Instant) {
+    tokio::time::sleep_until(instant.into()).await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn sleep_duration(duration: Duration) {
+    tokio::time::sleep(duration).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn sleep_until_instant(instant: Instant) {
+    let duration = instant.duration_since(Instant::now());
+    sleep_duration(duration).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn sleep_duration(duration: Duration) {
+    let millis = duration.as_millis().min(u32::MAX as u128) as u32;
+    zenoh_runtime::wasm_yield::sleep_ms(millis).await;
 }
 
 #[zenoh_macros::unstable]
