@@ -20,8 +20,6 @@ use zenoh_runtime::wasm_yield::Instant;
 
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::task::JoinHandle;
-#[cfg(target_arch = "wasm32")]
-use zenoh_runtime::JoinHandle;
 use zenoh_buffers::{BBuf, ZSlice, ZSliceBuffer};
 use zenoh_core::{zcondfeat, zlock};
 use zenoh_link::{LinkMulticast, Locator};
@@ -32,6 +30,8 @@ use zenoh_protocol::{
     },
 };
 use zenoh_result::{zerror, ZResult};
+#[cfg(target_arch = "wasm32")]
+use zenoh_runtime::JoinHandle;
 use zenoh_sync::{RecyclingObject, RecyclingObjectPool, Signal};
 
 use crate::{
@@ -548,9 +548,9 @@ async fn tx_task(
                 None => {
                     let mut batches = pipeline.drain();
                     for (mut b, _) in batches.drain(..) {
-                        link.send_batch(&mut b).await.map_err(|e| {
-                            zerror!("{}: flush failed: {}", link, e)
-                        })?;
+                        link.send_batch(&mut b)
+                            .await
+                            .map_err(|e| zerror!("{}: flush failed: {}", link, e))?;
                         #[cfg(feature = "stats")]
                         {
                             stats.inc_bytes(zenoh_stats::Tx, b.len() as u64);

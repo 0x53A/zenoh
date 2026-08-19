@@ -15,9 +15,6 @@ use std::{fmt, ops::Deref, time::Duration};
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::net::SocketAddr;
-
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::net::UdpSocket;
 use zenoh_config::wrappers::Hello;
 use zenoh_protocol::core::WhatAmIMatcher;
 use zenoh_result::ZResult;
@@ -176,10 +173,10 @@ pub(crate) fn _scout(
     );
     let ifaces = Runtime::get_interfaces(ifaces);
     if !ifaces.is_empty() {
-        let sockets: Vec<UdpSocket> = ifaces
+        let sockets = ifaces
             .into_iter()
             .filter_map(|iface| Runtime::bind_ucast_port(iface, multicast_ttl).ok())
-            .collect();
+            .collect::<Vec<_>>();
         if !sockets.is_empty() {
             let cancellation_token = TerminatableTask::create_cancellation_token();
             let cancellation_token_clone = cancellation_token.clone();

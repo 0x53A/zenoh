@@ -62,7 +62,6 @@ pub struct LinkUnicastWs {
     _io_close_tx: flume::Sender<()>,
 }
 
-
 /// Result of synchronously setting up a WebSocket connection.
 /// All !Send types are already wrapped in SendWrapper.
 /// Closures are stored and returned so they can be dropped when the link closes.
@@ -169,10 +168,9 @@ impl LinkUnicastWs {
         // This ensures all JS WebSocket objects and their callbacks live on a worker
         // that never calls block_in_place, preventing event loop deadlocks.
         // The result channels (write_tx, recv_rx) cross back via shared memory.
-        let (result_tx, result_rx) = flume::bounded::<Result<
-            (flume::Sender<WriteCmd>, flume::Receiver<Vec<u8>>),
-            String,
-        >>(1);
+        let (result_tx, result_rx) = flume::bounded::<
+            Result<(flume::Sender<WriteCmd>, flume::Receiver<Vec<u8>>), String>,
+        >(1);
 
         // Use a close_rx channel to keep the Acceptor task (and its closures)
         // alive until the link is closed.
@@ -197,7 +195,8 @@ impl LinkUnicastWs {
                     return;
                 }
                 Err(_) => {
-                    let _ = result_tx.send(Err("WebSocket open channel closed unexpectedly".into()));
+                    let _ =
+                        result_tx.send(Err("WebSocket open channel closed unexpectedly".into()));
                     return;
                 }
             }
@@ -389,6 +388,10 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastWs {
     }
 
     async fn get_locators(&self) -> Vec<Locator> {
+        vec![]
+    }
+
+    async fn get_locators_noloopback(&self) -> Vec<Locator> {
         vec![]
     }
 }

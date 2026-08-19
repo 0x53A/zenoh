@@ -11,9 +11,9 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use std::{error::Error, fmt::Display};
 #[cfg(not(target_arch = "wasm32"))]
 use std::{env, path::PathBuf, str::FromStr};
+use std::{error::Error, fmt::Display};
 
 use serde::{
     de::{value::MapAccessDeserializer, Visitor},

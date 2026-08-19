@@ -11,6 +11,8 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{Duration, Instant};
 use std::{
     fmt,
     sync::{
@@ -18,8 +20,6 @@ use std::{
         Arc,
     },
 };
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::{Duration, Instant};
 
 use event_listener::Event as EventLib;
 #[cfg(not(target_arch = "wasm32"))]

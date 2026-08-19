@@ -20,9 +20,7 @@
 // --- Async Mutex / RwLock ---
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use tokio::sync::{
-    Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock as AsyncRwLock,
-};
+pub use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock as AsyncRwLock};
 
 // With wasm-threads (SharedArrayBuffer), use tokio::sync::Mutex which
 // works correctly with cross-worker waking and block_in_place.

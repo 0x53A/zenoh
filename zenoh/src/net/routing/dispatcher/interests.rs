@@ -20,7 +20,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use zenoh_task::CancellationToken;
 use zenoh_protocol::{
     core::Region,
     network::{
@@ -30,6 +29,7 @@ use zenoh_protocol::{
     },
 };
 use zenoh_sync::get_mut_unchecked;
+use zenoh_task::CancellationToken;
 #[cfg(not(target_arch = "wasm32"))]
 use zenoh_util::Timed;
 

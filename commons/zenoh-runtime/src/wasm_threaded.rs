@@ -160,7 +160,6 @@ extern "C" {
     fn set_timeout(f: &js_sys::Function, millis: i32);
 }
 
-
 impl<T> JoinHandle<T> {
     pub fn abort(&self) {
         // Cannot abort spawned tasks on WASM workers
@@ -246,7 +245,9 @@ static TASK_RECEIVERS: OnceLock<Vec<flume::Receiver<BoxedTask>>> = OnceLock::new
 /// JS microtask wakers cannot be triggered reliably from other threads.
 #[wasm_bindgen]
 pub fn __zenoh_worker_entry(variant_id: u32) {
-    let receivers = TASK_RECEIVERS.get().expect("Task receivers not initialized");
+    let receivers = TASK_RECEIVERS
+        .get()
+        .expect("Task receivers not initialized");
     let rx = receivers[variant_id as usize].clone();
 
     // Signal that this worker is ready
@@ -462,7 +463,10 @@ pub fn __zenoh_init_threaded_runtime(shim_url: &str) -> bool {
     let _ = SHIM_URL.set(shim_url.to_string());
     WORKER_POOL.get_or_init(|| WorkerPool::new(shim_url));
     THREADED_MODE.store(true, Ordering::Release);
-    tracing::info!("Zenoh threaded WASM runtime initialized with {} workers", NUM_WORKERS);
+    tracing::info!(
+        "Zenoh threaded WASM runtime initialized with {} workers",
+        NUM_WORKERS
+    );
     true
 }
 

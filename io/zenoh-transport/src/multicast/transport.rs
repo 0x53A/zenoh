@@ -21,7 +21,6 @@ use std::{
     time::Duration,
 };
 
-use zenoh_task::CancellationToken;
 use zenoh_core::{zcondfeat, zread, zwrite};
 use zenoh_link::{Link, Locator};
 use zenoh_protocol::{
@@ -29,6 +28,7 @@ use zenoh_protocol::{
     transport::{batch_size, close, join::ext::PatchType, Close, Join, TransportMessage},
 };
 use zenoh_result::{bail, ZResult};
+use zenoh_task::CancellationToken;
 use zenoh_task::TaskController;
 
 use super::{
@@ -36,14 +36,13 @@ use super::{
     link::{TransportLinkMulticastConfigUniversal, TransportLinkMulticastUniversal},
 };
 #[cfg(feature = "shared-memory")]
-use crate::shm_context::MulticastTransportShmContext;
+use crate::common::shm::shm_context::MulticastTransportShmContext;
 use crate::{
     multicast::{
         link::TransportLinkMulticast, TransportConfigMulticast, TransportMulticastEventHandler,
     },
     TransportManager, TransportPeer, TransportPeerEventHandler,
 };
-// use zenoh_util::{Timed, TimedEvent, TimedHandle, Timer};
 
 /*************************************/
 /*             TRANSPORT             */

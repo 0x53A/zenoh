@@ -17,6 +17,7 @@
 //! This crate is intended for Zenoh's internal use.
 //!
 //! [Click here for Zenoh's documentation](https://docs.rs/zenoh/latest/zenoh)
+#[cfg(not(target_arch = "wasm32"))]
 use lazy_static::lazy_static;
 
 pub mod ffi;

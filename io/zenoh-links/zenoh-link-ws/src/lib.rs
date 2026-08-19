@@ -27,15 +27,15 @@ use async_trait::async_trait;
 use url::Url;
 use zenoh_core::zconfigurable;
 use zenoh_link_commons::LocatorInspector;
+#[cfg(not(target_arch = "wasm32"))]
+use zenoh_protocol::core::endpoint::Address;
 use zenoh_protocol::{
     core::{Locator, Metadata, Reliability},
     transport::BatchSize,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use zenoh_protocol::core::endpoint::Address;
-use zenoh_result::ZResult;
-#[cfg(not(target_arch = "wasm32"))]
 use zenoh_result::bail;
+use zenoh_result::ZResult;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod unicast_native;

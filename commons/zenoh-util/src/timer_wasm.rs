@@ -48,10 +48,7 @@ impl TimedEvent {
         }
     }
 
-    pub fn periodic(
-        _interval: Duration,
-        _event: impl Timed + Send + Sync + 'static,
-    ) -> Self {
+    pub fn periodic(_interval: Duration, _event: impl Timed + Send + Sync + 'static) -> Self {
         TimedEvent {
             fused: Arc::new(AtomicBool::new(true)),
         }

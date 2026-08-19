@@ -11,14 +11,14 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+#[cfg(not(target_arch = "wasm32"))]
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::{
     collections::{HashMap, HashSet},
     ops::DerefMut,
     str::FromStr,
     time::Duration,
 };
-#[cfg(not(target_arch = "wasm32"))]
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use futures::{prelude::*, stream::FuturesUnordered};
 #[cfg(not(target_arch = "wasm32"))]
@@ -26,7 +26,6 @@ use socket2::{Domain, Socket, Type};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::net::UdpSocket;
 use tokio::sync::{futures::Notified, Mutex, Notify};
-use zenoh_task::CancellationToken;
 #[cfg(not(target_arch = "wasm32"))]
 use zenoh_buffers::{
     reader::{DidntRead, HasReader},
@@ -48,6 +47,7 @@ use zenoh_protocol::{
     scouting::{HelloProto, Scout, ScoutingBody, ScoutingMessage},
 };
 use zenoh_result::{bail, zerror, ZResult};
+use zenoh_task::CancellationToken;
 
 use super::{Runtime, RuntimeSession};
 #[cfg(not(target_arch = "wasm32"))]
@@ -58,6 +58,31 @@ const RCV_BUF_SIZE: usize = u16::MAX as usize;
 const SCOUT_INITIAL_PERIOD: Duration = Duration::from_millis(1_000);
 const SCOUT_MAX_PERIOD: Duration = Duration::from_millis(8_000);
 const SCOUT_PERIOD_INCREASE_FACTOR: u32 = 2;
+
+// TODO(fuzzypixelz): collapse per-interface scout sockets into one wildcard socket
+// per address family. Select egress with `set_multicast_if_*` before send;
+// serialize set+send because the socket option is mutable.
+/// UDP scout socket for one multicast egress interface.
+///
+/// The socket is wildcard-bound; `iface` pins multicast egress via socket
+/// options.[^mcast-if]
+///
+/// [^mcast-if]: [`Socket::set_multicast_if_v4`], [`Socket::set_multicast_if_v6`].
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct ScoutSocket {
+    /// Wildcard-bound UDP socket used for Scout/Hello traffic.
+    socket: UdpSocket,
+    /// Interface address used for multicast egress and responder matching.
+    iface: IpAddr,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ScoutSocket {
+    /// Sends a multicast datagram through this socket's egress interface.
+    async fn send_multicast(&self, buffer: &[u8], dst: SocketAddr) -> std::io::Result<usize> {
+        self.socket.send_to(buffer, dst).await
+    }
+}
 
 #[derive(Debug)]
 pub enum Loop {
@@ -192,7 +217,7 @@ impl Runtime {
                 if ifaces.is_empty() {
                     bail!("Unable to find multicast interface!")
                 } else {
-                    let sockets: Vec<UdpSocket> = ifaces
+                    let sockets: Vec<ScoutSocket> = ifaces
                         .into_iter()
                         .filter_map(|iface| Runtime::bind_ucast_port(iface, multicast_ttl).ok())
                         .collect();
@@ -251,7 +276,7 @@ impl Runtime {
         } else {
             for peer_group in &peers {
                 for endpoint in peer_group.as_vec() {
-                    self.peer_connector(endpoint).await;
+                    self.peer_connector(endpoint).await?;
                 }
             }
             Ok(())
@@ -318,7 +343,7 @@ impl Runtime {
         self.bind_listeners(&listeners).await?;
         for peer_group in &peers {
             for endpoint in peer_group.as_vec() {
-                self.peer_connector(endpoint).await;
+                self.peer_connector(endpoint).await?;
             }
         }
         Ok(())
@@ -385,7 +410,7 @@ impl Runtime {
         self.bind_listeners(&listeners).await?;
         for peer_group in &peers {
             for endpoint in peer_group.as_vec() {
-                self.peer_connector(endpoint).await;
+                self.peer_connector(endpoint).await?;
             }
         }
         Ok(())
@@ -407,7 +432,7 @@ impl Runtime {
         let ifaces = Runtime::get_interfaces(&ifaces);
         let mcast_socket = Runtime::bind_mcast_port(&addr, &ifaces, multicast_ttl).await?;
         if !ifaces.is_empty() {
-            let sockets: Vec<UdpSocket> = ifaces
+            let sockets: Vec<ScoutSocket> = ifaces
                 .into_iter()
                 .filter_map(|iface| Runtime::bind_ucast_port(iface, multicast_ttl).ok())
                 .collect();
@@ -710,9 +735,11 @@ impl Runtime {
     }
 
     fn print_locators(&self) {
-        let mut locators = self.state.locators.write().unwrap();
-        *locators = self.manager().get_locators();
-        for locator in &*locators {
+        let locators = self.manager().get_locators();
+        let locators_noloopback = self.manager().get_locators_noloopback();
+        *self.state.locators.write().unwrap() = locators;
+        *self.state.locators_noloopback.write().unwrap() = locators_noloopback.clone();
+        for locator in &locators_noloopback {
             tracing::info!("Zenoh can be reached at: {}", locator);
         }
     }
@@ -848,40 +875,120 @@ impl Runtime {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn bind_ucast_port(addr: IpAddr, multicast_ttl: u32) -> ZResult<UdpSocket> {
-        let sockaddr = || SocketAddr::new(addr, 0);
-        let socket = match Socket::new(Domain::for_address(sockaddr()), Type::DGRAM, None) {
+    /// Binds a scout socket for `iface`.
+    ///
+    /// The socket is bound to the address-family wildcard; `iface` is selected
+    /// with multicast egress socket options.[^mcast-if]
+    ///
+    /// [^mcast-if]: [`Socket::set_multicast_if_v4`], [`Socket::set_multicast_if_v6`].
+    pub(crate) fn bind_ucast_port(iface: IpAddr, multicast_ttl: u32) -> ZResult<ScoutSocket> {
+        let bind_addr = match iface {
+            IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+        };
+        let socket = match Socket::new(Domain::for_address(bind_addr), Type::DGRAM, None) {
             Ok(socket) => socket,
             Err(err) => {
-                tracing::warn!("Unable to create datagram socket: {}", err);
-                bail!(err=> "Unable to create datagram socket");
+                tracing::warn!(
+                    "Unable to create UDP scout socket for multicast interface {}: {}",
+                    iface,
+                    err
+                );
+                bail!(err => "Unable to create UDP scout socket for multicast interface {}", iface);
             }
         };
-        match socket.bind(&sockaddr().into()) {
+
+        match iface {
+            IpAddr::V4(addr) => {
+                if !addr.is_unspecified() {
+                    socket.set_multicast_if_v4(&addr).map_err(|err| {
+                        zerror!(
+                            "Unable to select multicast interface {} on UDP scout socket: {}",
+                            iface,
+                            err
+                        )
+                    })?;
+                }
+                socket.set_multicast_ttl_v4(multicast_ttl).map_err(|err| {
+                    zerror!(
+                        "Unable to set multicast TTL {} on UDP scout socket for multicast interface {}: {}",
+                        multicast_ttl,
+                        iface,
+                        err
+                    )
+                })?;
+            }
+            IpAddr::V6(addr) => {
+                if !addr.is_unspecified() {
+                    let idx = zenoh_util::net::get_index_of_interface(IpAddr::V6(addr))?;
+                    socket.set_multicast_if_v6(idx).map_err(|err| {
+                        zerror!(
+                            "Unable to select multicast interface {} on UDP scout socket: {}",
+                            iface,
+                            err
+                        )
+                    })?;
+                }
+                socket.set_multicast_hops_v6(multicast_ttl).map_err(|err| {
+                    zerror!(
+                        "Unable to set multicast hop limit {} on UDP scout socket for multicast interface {}: {}",
+                        multicast_ttl,
+                        iface,
+                        err
+                    )
+                })?;
+            }
+        }
+
+        match socket.bind(&bind_addr.into()) {
             Ok(()) => {
                 #[allow(clippy::or_fun_call)]
                 let local_addr = socket
                     .local_addr()
-                    .unwrap_or(sockaddr().into())
+                    .unwrap_or(bind_addr.into())
                     .as_socket()
-                    .unwrap_or(sockaddr());
-                tracing::debug!("UDP port bound to {}", local_addr);
+                    .unwrap_or(bind_addr);
+                tracing::debug!(
+                    "UDP scout socket bound to {} for multicast interface {}",
+                    local_addr,
+                    iface
+                );
             }
             Err(err) => {
-                tracing::warn!("Unable to bind udp port {}:0: {}", addr, err);
-                bail!(err => "Unable to bind udp port {}:0", addr);
+                tracing::warn!(
+                    "Unable to bind UDP scout socket to {} for multicast interface {}: {}",
+                    bind_addr,
+                    iface,
+                    err
+                );
+                bail!(err => "Unable to bind UDP scout socket to {} for multicast interface {}", bind_addr, iface);
             }
         }
 
         // Must set to nonblocking according to the doc of tokio
         // https://docs.rs/tokio/latest/tokio/net/struct.UdpSocket.html#notes
-        socket.set_nonblocking(true)?;
-        socket.set_multicast_ttl_v4(multicast_ttl)?;
+        socket.set_nonblocking(true).map_err(|err| {
+            zerror!(
+                "Unable to make UDP scout socket non-blocking for multicast interface {}: {}",
+                iface,
+                err
+            )
+        })?;
 
         // UdpSocket::from_std requires a runtime even though it's a sync function
         let udp_socket = zenoh_runtime::ZRuntime::Net
-            .block_in_place(async { UdpSocket::from_std(socket.into()) })?;
-        Ok(udp_socket)
+            .block_in_place(async { UdpSocket::from_std(socket.into()) })
+            .map_err(|err| {
+                zerror!(
+                    "Unable to create async UDP scout socket for multicast interface {}: {}",
+                    iface,
+                    err
+                )
+            })?;
+        Ok(ScoutSocket {
+            socket: udp_socket,
+            iface,
+        })
     }
 
     async fn spawn_peer_connector(&self, peer: EndPoint) -> ZResult<()> {
@@ -1033,8 +1140,8 @@ impl Runtime {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub async fn scout<Fut, F>(
-        sockets: &[UdpSocket],
+    pub(crate) async fn scout<Fut, F>(
+        sockets: &[ScoutSocket],
         matcher: WhatAmIMatcher,
         mcast_addr: &SocketAddr,
         f: F,
@@ -1063,21 +1170,14 @@ impl Runtime {
                         "Send {:?} to {} on interface {}",
                         scout.body,
                         mcast_addr,
-                        socket
-                            .local_addr()
-                            .map_or("unknown".to_string(), |addr| addr.ip().to_string())
+                        socket.iface
                     );
-                    if let Err(err) = socket
-                        .send_to(wbuf.as_slice(), mcast_addr.to_string())
-                        .await
-                    {
+                    if let Err(err) = socket.send_multicast(wbuf.as_slice(), *mcast_addr).await {
                         tracing::debug!(
                             "Unable to send {:?} to {} on interface {}: {}",
                             scout.body,
                             mcast_addr,
-                            socket
-                                .local_addr()
-                                .map_or("unknown".to_string(), |addr| addr.ip().to_string()),
+                            socket.iface,
                             err
                         );
                     }
@@ -1093,7 +1193,7 @@ impl Runtime {
             async move {
                 let mut buf = vec![0; RCV_BUF_SIZE];
                 loop {
-                    match socket.recv_from(&mut buf).await {
+                    match socket.socket.recv_from(&mut buf).await {
                         Ok((n, peer)) => {
                             let mut reader = buf.as_slice()[..n].reader();
                             let codec = Zenoh080::new();
@@ -1271,7 +1371,7 @@ impl Runtime {
     #[cfg(not(target_arch = "wasm32"))]
     async fn connect_first(
         &self,
-        sockets: &[UdpSocket],
+        sockets: &[ScoutSocket],
         what: WhatAmIMatcher,
         addr: &SocketAddr,
         timeout: std::time::Duration,
@@ -1304,7 +1404,7 @@ impl Runtime {
     #[cfg(not(target_arch = "wasm32"))]
     async fn autoconnect_all(
         &self,
-        ucast_sockets: &[UdpSocket],
+        ucast_sockets: &[ScoutSocket],
         autoconnect: AutoConnect,
         addr: &SocketAddr,
     ) {
@@ -1325,34 +1425,53 @@ impl Runtime {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    async fn responder(&self, mcast_socket: &UdpSocket, ucast_sockets: &[UdpSocket]) {
-        fn get_best_match<'a>(addr: &IpAddr, sockets: &'a [UdpSocket]) -> Option<&'a UdpSocket> {
+    /// Locators advertised in a scouting [`HelloProto`] to `peer`.
+    ///
+    /// Loopback peers get loopback locators; public locators intentionally
+    /// exclude loopback.
+    fn get_hello_locators(&self, peer: &SocketAddr) -> Vec<Locator> {
+        if peer.ip().is_loopback() {
+            self.get_locators()
+        } else {
+            self.get_locators_noloopback()
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn responder(&self, mcast_socket: &UdpSocket, ucast_sockets: &[ScoutSocket]) {
+        fn get_best_match<'a>(
+            addr: &IpAddr,
+            sockets: &'a [ScoutSocket],
+        ) -> Option<&'a ScoutSocket> {
             fn octets(addr: &IpAddr) -> Vec<u8> {
                 match addr {
                     IpAddr::V4(addr) => addr.octets().to_vec(),
                     IpAddr::V6(addr) => addr.octets().to_vec(),
                 }
             }
-            fn matching_octets(addr: &IpAddr, sock: &UdpSocket) -> usize {
+            fn matching_octets(addr: &IpAddr, sock: &ScoutSocket) -> usize {
                 octets(addr)
                     .iter()
-                    .zip(octets(&sock.local_addr().unwrap().ip()))
+                    .zip(octets(&sock.iface))
                     .map(|(x, y)| x.cmp(&y))
                     .position(|ord| ord != std::cmp::Ordering::Equal)
                     .unwrap_or_else(|| octets(addr).len())
             }
-            sockets
-                .iter()
-                .filter(|sock| sock.local_addr().is_ok())
-                .max_by(|sock1, sock2| {
-                    matching_octets(addr, sock1).cmp(&matching_octets(addr, sock2))
-                })
+            sockets.iter().max_by(|sock1, sock2| {
+                matching_octets(addr, sock1).cmp(&matching_octets(addr, sock2))
+            })
         }
 
         let mut buf = vec![0; RCV_BUF_SIZE];
         let local_addrs: Vec<SocketAddr> = ucast_sockets
             .iter()
-            .filter_map(|sock| sock.local_addr().ok())
+            .filter_map(|sock| {
+                sock.socket
+                    .local_addr()
+                    .ok()
+                    .map(|addr| (sock.iface, addr.port()))
+            })
+            .map(|(iface, port)| SocketAddr::new(iface, port))
             .collect();
         tracing::debug!("Waiting for UDP datagram...");
         loop {
@@ -1378,7 +1497,7 @@ impl Runtime {
                             version: zenoh_protocol::VERSION,
                             whatami: self.whatami(),
                             zid,
-                            locators: self.get_locators(),
+                            locators: self.get_hello_locators(&peer),
                         }
                         .into();
                         let socket = get_best_match(&peer.ip(), ucast_sockets).unwrap();
@@ -1386,13 +1505,11 @@ impl Runtime {
                             "Send {:?} to {} on interface {}",
                             hello.body,
                             peer,
-                            socket
-                                .local_addr()
-                                .map_or("unknown".to_string(), |addr| addr.ip().to_string())
+                            socket.iface
                         );
                         codec.write(&mut writer, &hello).unwrap();
 
-                        if let Err(err) = socket.send_to(wbuf.as_slice(), peer).await {
+                        if let Err(err) = socket.socket.send_to(wbuf.as_slice(), peer).await {
                             tracing::error!("Unable to send {:?} to {}: {}", hello.body, peer, err);
                         }
                     }
@@ -1497,5 +1614,34 @@ impl Runtime {
             .values()
             .flat_map(|hat| hat.links_info().into_iter())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::time::{timeout, Duration};
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scout_sender_can_multicast_on_loopback() {
+        let iface = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let group = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 224));
+        let rx = Runtime::bind_mcast_port(&SocketAddr::new(group, 0), &[iface], 1)
+            .await
+            .unwrap();
+        let dst = SocketAddr::new(group, rx.local_addr().unwrap().port());
+        let tx = Runtime::bind_ucast_port(iface, 1).unwrap();
+        let payload = b"zenoh loopback multicast regression";
+
+        let sent = tx.send_multicast(payload, dst).await.unwrap();
+        assert_eq!(sent, payload.len());
+
+        let mut buf = [0; 256];
+        let (n, _) = timeout(Duration::from_secs(2), rx.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for loopback multicast packet")
+            .unwrap();
+        assert_eq!(&buf[..n], payload);
     }
 }

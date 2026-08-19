@@ -119,8 +119,7 @@ impl<StartArgs: PluginStartArgs, Instance: PluginInstance> fmt::Debug
         s.field("default_lib_prefix", &self.default_lib_prefix);
         #[cfg(not(target_arch = "wasm32"))]
         s.field("loader", &self.loader.as_ref().map(|_| ".."));
-        s.field("plugins_len", &self.plugins.len())
-            .finish()
+        s.field("plugins_len", &self.plugins.len()).finish()
     }
 }
 

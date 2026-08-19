@@ -161,17 +161,12 @@ impl Default for TaskController {
 }
 
 impl TaskController {
-    pub fn into_abortable<'a, F, T>(
-        &self,
-        future: F,
-    ) -> impl Future<Output = Option<T>> + Send + 'a
+    pub fn into_abortable<'a, F, T>(&self, future: F) -> impl Future<Output = Option<T>> + Send + 'a
     where
         F: Future<Output = T> + Send + 'a,
         T: Send + 'static,
     {
-        self.token
-            .child_token()
-            .run_until_cancelled_owned(future)
+        self.token.child_token().run_until_cancelled_owned(future)
     }
 
     pub fn spawn_abortable<F, T>(&self, future: F) -> JoinHandle<Option<T>>
@@ -190,11 +185,7 @@ impl TaskController {
         })
     }
 
-    pub fn spawn_abortable_with_rt<F, T>(
-        &self,
-        rt: ZRuntime,
-        future: F,
-    ) -> JoinHandle<Option<T>>
+    pub fn spawn_abortable_with_rt<F, T>(&self, rt: ZRuntime, future: F) -> JoinHandle<Option<T>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,

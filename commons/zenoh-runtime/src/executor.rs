@@ -222,8 +222,7 @@ impl LocalExecutor {
     pub fn block_on<F: Future>(&self, f: F) -> F::Output {
         let mut f = std::pin::pin!(f);
 
-        let waker: std::task::Waker =
-            Arc::new(BlockOnWaker(self.wake_state.clone())).into();
+        let waker: std::task::Waker = Arc::new(BlockOnWaker(self.wake_state.clone())).into();
         let mut cx = Context::from_waker(&waker);
 
         loop {
@@ -247,10 +246,7 @@ impl LocalExecutor {
                     {
                         // Sleep until woken, timer fires, or timeout
                         let timeout = self.time_until_next_timer(&inner, Duration::from_millis(1));
-                        let _ = self
-                            .wake_state
-                            .condvar
-                            .wait_timeout(inner, timeout);
+                        let _ = self.wake_state.condvar.wait_timeout(inner, timeout);
                     }
                 }
             }
@@ -269,10 +265,7 @@ impl LocalExecutor {
             let inner = self.wake_state.inner.lock().unwrap();
             if inner.task_queue.is_empty() && self.spawn_queue.borrow().is_empty() {
                 let timeout = self.time_until_next_timer(&inner, Duration::from_millis(100));
-                let _ = self
-                    .wake_state
-                    .condvar
-                    .wait_timeout(inner, timeout);
+                let _ = self.wake_state.condvar.wait_timeout(inner, timeout);
             }
         }
     }

@@ -28,10 +28,8 @@ use std::{
 
 use lazy_static::lazy_static;
 use serde::Deserialize;
+use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 pub use tokio::task::JoinHandle;
-use tokio::{
-    runtime::{Handle, Runtime, RuntimeFlavor},
-};
 use zenoh_macros::{GenericRuntimeParam, RegisterParam};
 use zenoh_result::ZResult as Result;
 
