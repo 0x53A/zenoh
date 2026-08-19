@@ -132,7 +132,7 @@ impl std::fmt::Debug for TerminatableTask {
         f.debug_struct("TerminatableTask")
             .field(
                 "is_finished",
-                &self.handle.as_ref().is_none_or(|h| h.is_finished()),
+                &self.handle.as_ref().map_or(true, |h| h.is_finished()),
             )
             .finish_non_exhaustive()
     }
