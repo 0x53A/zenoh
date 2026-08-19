@@ -1,5 +1,9 @@
 # zenohd WebSocket listener permanently dies on a single malformed handshake
 
+> Resolved upstream in Zenoh 1.10.0 by `7ef822fc1` (`fix(link-ws): prevent
+> accept_task from exiting on handshake failure`). The remainder of this file
+> is retained as the original Zenoh 1.9.0 report and root-cause analysis.
+
 ## Summary
 
 A single TCP connection to a `ws/` listener that fails the WebSocket
