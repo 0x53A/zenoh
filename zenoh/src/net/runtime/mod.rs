@@ -1083,9 +1083,14 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
                     // Use the blocking variant to avoid block_in_place, which on
                     // WASM with SharedArrayBuffer would freeze the JS event loop
                     // and deadlock WebSocket callbacks.
-                    runtime
-                        .manager()
-                        .get_transports_unicast_blocking()
+                    #[cfg(target_arch = "wasm32")]
+                    let transports = runtime.manager().get_transports_unicast_blocking();
+
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let transports = zenoh_runtime::ZRuntime::Net
+                        .block_in_place(runtime.manager().get_transports_unicast());
+
+                    transports
                         .iter()
                         .filter(|transport| {
                             let Ok(peer) = transport.get_peer() else {
