@@ -195,7 +195,7 @@ impl TransportUnicastUniversal {
         // Notify the callback
         if let Some(callback) = self.callback.get().cloned() {
             let associated_link = associated_link.clone();
-            tokio::task::spawn_blocking(move || {
+            let notify = move || {
                 callback.del_link(link);
                 if let Some(asl) = &associated_link {
                     callback.del_link(Link::new_unicast(
@@ -204,8 +204,11 @@ impl TransportUnicastUniversal {
                         asl.link.config.reliability,
                     ));
                 }
-            })
-            .await?;
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            tokio::task::spawn_blocking(notify).await?;
+            #[cfg(target_arch = "wasm32")]
+            notify();
         }
 
         // Associated link must also be closed. run both close calls, return whichever failed first
