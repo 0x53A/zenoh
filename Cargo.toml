@@ -126,6 +126,7 @@ home = "0.5.9"
 humantime = "2.3.0"
 io-uring = "0.7.10"
 itertools = "0.14.0"
+js-sys = "0.3"
 json5 = "0.4.1"
 jsonschema = { version = "0.20", default-features = false } # Don't bump jsonschem version because of invalid license while running `cargo deny check licenses`
 keyed-set = "1.1.0"

@@ -1018,9 +1018,19 @@ pub(crate) trait PipelineConsumer {
             };
             #[cfg(target_arch = "wasm32")]
             let backoff_wait: Result<Result<(), zenoh_sync::WaitError>, ()> = {
-                // On WASM, tokio::time is not available; just await the notification directly
-                let _ = backoff;
-                Ok(self.n_out_r().wait_async().await)
+                match backoff {
+                    Some(remaining_us) => {
+                        // A notification can arrive before an incomplete batch's linger
+                        // deadline. Waiting only for the next notification loses the
+                        // deadline wakeup and can leave the TX pipeline asleep indefinitely.
+                        // The worker runtime's timer queue provides the timeout side of the
+                        // native `tokio::time::timeout` behavior.
+                        let remaining_ms = remaining_us.saturating_add(999) / 1_000;
+                        zenoh_runtime::wasm_yield::sleep_ms(remaining_ms.max(1)).await;
+                        Err(())
+                    }
+                    None => Ok(self.n_out_r().wait_async().await),
+                }
             };
             match backoff_wait {
                 Ok(Ok(())) => {

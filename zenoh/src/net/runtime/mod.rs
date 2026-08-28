@@ -84,6 +84,7 @@ use super::{
         namespace::{ENamespace, Namespace},
     },
 };
+
 #[cfg(feature = "plugins")]
 use crate::api::loader::{load_plugins, start_plugins};
 #[cfg(feature = "plugins")]
@@ -104,6 +105,28 @@ use crate::{
     },
     GIT_VERSION,
 };
+
+fn build_hlc(id: uhlc::ID) -> HLC {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        HLCBuilder::new().with_id(id).build()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        HLCBuilder::new()
+            .with_id(id)
+            .with_clock(browser_time_clock)
+            .build()
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn browser_time_clock() -> uhlc::NTP64 {
+    // `SystemTime::now()` is unsupported on wasm32-unknown-unknown, while
+    // JavaScript's Date clock is available in both windows and Web Workers.
+    std::time::Duration::from_millis(js_sys::Date::now() as u64).into()
+}
 
 /// State of current lazily-initialized [`ShmProvider`](ShmProvider) associated with [`Runtime`](Runtime)
 #[cfg(feature = "shared-memory")]
@@ -281,9 +304,8 @@ impl IRuntime for RuntimeState {
         }
 
         let hlc = self.hlc.as_ref().unwrap_or_else(|| {
-            self.lazy_hlc.get_or_init(|| {
-                Arc::new(HLCBuilder::new().with_id(uhlc::ID::from(self.zid)).build())
-            })
+            self.lazy_hlc
+                .get_or_init(|| Arc::new(build_hlc(uhlc::ID::from(self.zid))))
         });
 
         let ts = hlc.new_timestamp();
@@ -750,7 +772,7 @@ impl RuntimeBuilder {
         let stats = zenoh_stats::StatsRegistry::new(zid, whatami, &*crate::LONG_VERSION);
 
         let hlc = (*unwrap_or_default!(config.timestamping().enabled().get(whatami)))
-            .then(|| Arc::new(HLCBuilder::new().with_id(uhlc::ID::from(&zid)).build()));
+            .then(|| Arc::new(build_hlc(uhlc::ID::from(&zid))));
 
         let mut gateway_builder = GatewayBuilder::new(&config);
 
