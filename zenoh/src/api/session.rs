@@ -11,6 +11,8 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::{hash_map::Entry, HashMap},
     convert::TryInto,
@@ -21,7 +23,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, RwLock, RwLockReadGuard,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -124,6 +126,51 @@ use crate::{
     query::ReplyError,
     Config,
 };
+
+/// Time since the Unix epoch, from whichever wall clock the platform has.
+///
+/// `SystemTime::now()` panics on `wasm32-unknown-unknown` -- there is no
+/// system clock behind it -- so the browser gets JavaScript's `Date` clock,
+/// which is available in windows and in Web Workers alike. This mirrors
+/// `net::runtime::browser_time_clock`, which already feeds the HLC; the
+/// difference is that this path runs when timestamping is *disabled* and no
+/// HLC exists, which is exactly where the panic used to be reachable.
+#[cfg(not(target_arch = "wasm32"))]
+fn wall_clock_now() -> Duration {
+    // UNIX_EPOCH returns a Timespec::zero(); unwrap should be permissible here.
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wall_clock_now() -> Duration {
+    Duration::from_millis(js_sys::Date::now() as u64)
+}
+
+/// `tokio::time::sleep`, or the browser equivalent on wasm32.
+///
+/// `tokio::time` has no timer driver under `wasm32-unknown-unknown`, so the
+/// query-timeout tasks below cannot use it. `wasm_yield::sleep_ms` goes
+/// through `setTimeout` on JS threads and through the compute workers' own
+/// timer queue under `wasm-threads`; either way the future is `Send`, so it
+/// drops straight into the same `tokio::select!` the native path uses.
+///
+/// Sub-millisecond timeouts round up to 1ms rather than to 0, so a short
+/// timeout still fires late instead of instantly.
+#[cfg(not(target_arch = "wasm32"))]
+fn sleep(duration: Duration) -> impl std::future::Future<Output = ()> + Send {
+    tokio::time::sleep(duration)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn sleep(duration: Duration) -> impl std::future::Future<Output = ()> + Send {
+    let millis = duration.as_millis().min(u128::from(u32::MAX)) as u32;
+    let millis = if millis == 0 && !duration.is_zero() {
+        1
+    } else {
+        millis
+    };
+    zenoh_runtime::wasm_yield::sleep_ms(millis)
+}
 
 zconfigurable! {
     pub(crate) static ref API_DATA_RECEPTION_CHANNEL_SIZE: usize = 256;
@@ -1055,9 +1102,7 @@ impl Session {
             Some(hlc) => hlc.new_timestamp(),
             None => {
                 // Called when the runtime is not initialized with an HLC.
-                // UNIX_EPOCH returns a Timespec::zero(); unwrap should be permissible here.
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().into();
-                Timestamp::new(now, self.zid().into())
+                Timestamp::new(wall_clock_now().into(), self.zid().into())
             }
         }
     }
@@ -2760,9 +2805,8 @@ impl Session {
             .spawn_with_rt(zenoh_runtime::ZRuntime::Net, {
                 let session = self.downgrade();
                 async move {
-                    #[cfg(not(target_arch = "wasm32"))]
                     tokio::select! {
-                        _ = tokio::time::sleep(timeout) => {
+                        _ = sleep(timeout) => {
                             let mut state = zwrite!(session.0.state);
                             if let Some(query) = state.queries.remove(&qid) {
                                 std::mem::drop(state);
@@ -2780,12 +2824,6 @@ impl Session {
                             }
                         }
                         _ = token.cancelled() => {}
-                    }
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        // On WASM, tokio::time is not available; just wait for cancellation
-                        let _ = timeout;
-                        token.cancelled().await;
                     }
                 }
             });
@@ -2934,9 +2972,8 @@ impl Session {
             .spawn_with_rt(zenoh_runtime::ZRuntime::Net, {
                 let session = self.downgrade();
                 async move {
-                    #[cfg(not(target_arch = "wasm32"))]
                     tokio::select! {
-                        _ = tokio::time::sleep(timeout) => {
+                        _ = sleep(timeout) => {
                             let mut state = zwrite!(session.0.state);
                             if let Some(query) = state.liveliness_queries.remove(&id) {
                                 std::mem::drop(state);
@@ -2949,12 +2986,6 @@ impl Session {
                             }
                         }
                         _ = token.cancelled() => {}
-                    }
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        // On WASM, tokio::time is not available; just wait for cancellation
-                        let _ = timeout;
-                        token.cancelled().await;
                     }
                 }
             });

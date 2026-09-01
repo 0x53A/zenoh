@@ -1020,14 +1020,20 @@ pub(crate) trait PipelineConsumer {
             let backoff_wait: Result<Result<(), zenoh_sync::WaitError>, ()> = {
                 match backoff {
                     Some(remaining_us) => {
-                        // A notification can arrive before an incomplete batch's linger
-                        // deadline. Waiting only for the next notification loses the
-                        // deadline wakeup and can leave the TX pipeline asleep indefinitely.
-                        // The worker runtime's timer queue provides the timeout side of the
-                        // native `tokio::time::timeout` behavior.
-                        let remaining_ms = remaining_us.saturating_add(999) / 1_000;
-                        zenoh_runtime::wasm_yield::sleep_ms(remaining_ms.max(1)).await;
-                        Err(())
+                        // Both halves of the native `tokio::time::timeout`: a
+                        // notification can arrive before an incomplete batch's linger
+                        // deadline, and the deadline can expire with no notification
+                        // coming at all. Waiting only for the notification leaves the
+                        // TX pipeline asleep indefinitely; sleeping out the whole
+                        // backoff instead charges every early-notified batch up to one
+                        // full linger interval of latency, and delays shutdown by the
+                        // same amount. Race them, notification first.
+                        let remaining_ms = (remaining_us.saturating_add(999) / 1_000).max(1);
+                        tokio::select! {
+                            biased;
+                            res = self.n_out_r().wait_async() => Ok(res),
+                            _ = zenoh_runtime::wasm_yield::sleep_ms(remaining_ms) => Err(()),
+                        }
                     }
                     None => Ok(self.n_out_r().wait_async().await),
                 }
