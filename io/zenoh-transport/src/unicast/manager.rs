@@ -512,19 +512,19 @@ impl TransportManager {
             );
             tracing::trace!("{}", e);
             let (l, asl) = link.fail();
-            return Err(InitTransportError::Link((
+            return Err(InitTransportError::Link(Box::new((
                 e.into(),
                 l,
                 asl,
                 close::reason::INVALID,
-            )));
+            ))));
         }
 
         // Add the link to the transport
         let (start_tx, start_rx, ack, add_link_guard) = transport
             .add_link(link, other_initial_sn, other_lease)
             .await
-            .map_err(InitTransportError::Link)?;
+            .map_err(|e| InitTransportError::Link(Box::new(e)))?;
 
         // complete establish procedure
         let c_link = ack.link();
@@ -613,7 +613,7 @@ impl TransportManager {
                     Ok(output) => output,
                     Err(e) => {
                         let (l, asl) = link.fail();
-                        return Err(InitTransportError::Link((e, l, asl, $reason)));
+                        return Err(InitTransportError::Link(Box::new((e, l, asl, $reason))));
                     }
                 }
             };
@@ -624,12 +624,12 @@ impl TransportManager {
             let e = zerror!("{} Attempt to establish transport to itself", self.zid());
             tracing::warn!("{e}");
             let (l, asl) = link.fail();
-            return Err(InitTransportError::Link((
+            return Err(InitTransportError::Link(Box::new((
                 e.into(),
                 l,
                 asl,
                 close::reason::CONNECTION_TO_SELF,
-            )));
+            ))));
         }
 
         // Verify that we haven't reached the transport number limit
@@ -641,12 +641,12 @@ impl TransportManager {
             );
             tracing::trace!("{e}");
             let (l, asl) = link.fail();
-            return Err(InitTransportError::Link((
+            return Err(InitTransportError::Link(Box::new((
                 e.into(),
                 l,
                 asl,
                 close::reason::INVALID,
-            )));
+            ))));
         }
 
         // Create the transport
@@ -720,7 +720,7 @@ impl TransportManager {
                 Ok(val) => val,
                 Err(e) => {
                     let _ = t.close(e.3).await;
-                    return Err(InitTransportError::Link(e));
+                    return Err(InitTransportError::Link(Box::new(e)));
                 }
             };
 
@@ -833,7 +833,8 @@ impl TransportManager {
 
         match init_result {
             Ok(transport) => Ok(TransportUnicast(Arc::downgrade(&transport))),
-            Err(InitTransportError::Link((e, link, associated_link, reason))) => {
+            Err(InitTransportError::Link(error)) => {
+                let (e, link, associated_link, reason) = *error;
                 let _ = link.close(Some(reason)).await;
                 if let Some(asl) = associated_link {
                     let _ = asl.close(Some(reason)).await;
