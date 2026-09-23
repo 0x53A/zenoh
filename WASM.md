@@ -31,13 +31,19 @@ They require a build with atomics, shared memory and `build-std`, plus browser
 cross-origin isolation. Its build script and `.cargo/config.toml` carry the
 complete flags; enabling the Cargo feature alone is insufficient.
 
-## Limits and deliberate compromises
+## Browser constraints and supported scope
 
 Browser networking is WS/WSS only: no UDP scouting, listeners, serial, shared
 memory transport, or dynamic native plugins. WASM low-latency transport is
 explicitly rejected; the default universal transport is the supported path.
 Peer/router modes do not make a browser into a listening network router.
 
+Background tabs can be throttled or suspended, so browser execution provides no
+hard scheduling guarantee.
+
+## WASM implementation tradeoffs
+
+The following choices belong to this port rather than upstream native Zenoh.
 The worker pool lives until page unload. Startup failures require a reload;
 workers cannot safely be killed while holding shared Rust locks. JS-thread
 cross-worker receives retain a timer-based repoll bridge. Short shared critical
@@ -48,7 +54,17 @@ Synchronous calls may block compute workers, but cannot wait on the page or I/O
 event loop. Publishing there can fail under contention. Incoming WebSocket
 backlogs are bounded; overload closes the link because the browser API exposes
 no receive-side backpressure. A send acknowledgement means browser acceptance,
-not remote application receipt. Background tabs can be throttled or suspended.
+not remote application receipt; remote receipt requires a separate acknowledgement.
+
+Replacing the repoll bridge requires cross-worker wake delivery. Restarting the
+pool requires coordinated task shutdown and shared-state recovery, not simply
+replacing a failed worker. These are runtime design changes, not small fixes.
+
+## General Zenoh corrections
+
+The native ring-channel timeout budget and task-termination ownership fixes
+recorded in the iterative review also apply independently of browser support.
+They are separate from the WASM runtime tradeoffs above.
 
 Native builds still use Tokio. Browser timeouts use the monotonic runtime timer;
 connection, acceptance and flush deadlines are not intentionally disabled.
