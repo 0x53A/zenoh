@@ -104,12 +104,18 @@ impl<T> RingChannelHandler<T> {
         let Some(channel) = self.ring.upgrade() else {
             bail!("The ringbuffer has been deleted.");
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        let started = Instant::now();
+        #[cfg(target_arch = "wasm32")]
+        let started = zenoh_runtime::wasm_yield::Instant::now();
 
         loop {
             if let Some(t) = channel.ring.lock().map_err(|e| zerror!("{}", e))?.pull() {
                 return Ok(Some(t));
             }
-            match channel.not_empty.recv_timeout(timeout) {
+            // Another receiver can consume the item associated with a wake.
+            // Keep the original deadline instead of restarting after each wake.
+            match channel.not_empty.recv_timeout(timeout.saturating_sub(started.elapsed())) {
                 Ok(()) => {}
                 Err(flume::RecvTimeoutError::Timeout) => return Ok(None),
                 Err(err) => bail!("{}", err),
@@ -145,6 +151,35 @@ impl<T> RingChannelHandler<T> {
         };
         let mut guard = channel.ring.lock().map_err(|e| zerror!("{}", e))?;
         Ok(guard.pull())
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod ring_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn empty_notifications_do_not_restart_receive_timeout() {
+        let (sender, receiver) = flume::bounded(1);
+        let inner = Arc::new(RingChannelInner::<u8> {
+            ring: std::sync::Mutex::new(RingBuffer::new(1)),
+            not_empty: receiver,
+        });
+        let handler = RingChannelHandler { ring: Arc::downgrade(&inner) };
+        let notifier = std::thread::spawn(move || {
+            // Model competing consumers taking each notified item first.
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = sender.try_send(());
+            }
+        });
+        let started = Instant::now();
+        let result = handler.recv_timeout(Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        notifier.join().unwrap();
+        assert!(result.unwrap().is_none());
+        assert!(elapsed >= Duration::from_millis(100));
+        assert!(elapsed < Duration::from_millis(300), "empty wakes extended the deadline: {elapsed:?}");
     }
 }
 
