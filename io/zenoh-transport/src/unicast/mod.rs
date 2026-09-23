@@ -14,6 +14,7 @@
 pub mod authentication;
 pub mod establishment;
 pub(crate) mod link;
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod lowlatency;
 pub(crate) mod manager;
 #[cfg(feature = "test")]

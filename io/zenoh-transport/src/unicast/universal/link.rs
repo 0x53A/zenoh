@@ -374,25 +374,17 @@ async fn write_loop(
     // Drain the transmission pipeline and write remaining bytes on the wire
     let mut batches = pipeline.drain();
     for (mut b, _) in batches.drain(..) {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            tokio::time::timeout(
-                keep_alive_tracker.timeout(),
-                link.send_batch(&mut b, write_priority),
+        zenoh_runtime::compat::timeout(
+            keep_alive_tracker.timeout(),
+            link.send_batch(&mut b, write_priority),
+        )
+        .await
+        .map_err(|_| {
+            zerror!(
+                "{link}: flush failed after {} ms",
+                keep_alive_tracker.timeout().as_millis()
             )
-            .await
-            .map_err(|_| {
-                zerror!(
-                    "{link}: flush failed after {} ms",
-                    keep_alive_tracker.timeout().as_millis()
-                )
-            })??;
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            // On WASM, tokio::time::timeout is not available; send without timeout
-            link.send_batch(&mut b, write_priority).await?;
-        }
+        })??;
 
         #[cfg(feature = "stats")]
         {

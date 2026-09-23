@@ -39,9 +39,10 @@ use super::{link::LinkUnicastWithOpenAck, transport_unicast_inner::InitTransport
 use crate::unicast::establishment::ext::auth::Auth;
 #[cfg(feature = "transport_multilink")]
 use crate::unicast::establishment::ext::multilink::MultiLink;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::unicast::lowlatency::transport::TransportUnicastLowlatency;
 use crate::{
     unicast::{
-        lowlatency::transport::TransportUnicastLowlatency,
         transport_unicast_inner::{InitTransportError, TransportUnicastTrait},
         universal::transport::TransportUnicastUniversal,
         TransportConfigUnicast, TransportUnicast,
@@ -282,6 +283,11 @@ impl TransportManagerBuilderUnicast {
         self,
         #[allow(unused)] prng: &mut PseudoRng, // Required for #[cfg(feature = "transport_multilink")]
     ) -> ZResult<TransportManagerParamsUnicast> {
+        #[cfg(target_arch = "wasm32")]
+        if self.is_lowlatency {
+            bail!("Low-latency transport is not supported on WASM; use the default universal transport");
+        }
+
         if self.is_qos && self.is_lowlatency {
             bail!("'qos' and 'lowlatency' options are incompatible");
         }
@@ -690,15 +696,28 @@ impl TransportManager {
 
         // Select and create transport implementation depending on the cfg and enabled features
         let t = if config.is_lowlatency {
-            tracing::debug!("Will use LowLatency transport!");
-            TransportUnicastLowlatency::make(
-                self.clone(),
-                config.clone(),
-                #[cfg(feature = "shared-memory")]
-                shm_context,
-                #[cfg(feature = "stats")]
-                stats,
-            )
+            #[cfg(target_arch = "wasm32")]
+            {
+                let (link, alternate) = link.fail();
+                return Err(InitTransportError::Link(Box::new((
+                    zerror!("Low-latency transport is not supported on WASM").into(),
+                    link,
+                    alternate,
+                    close::reason::INVALID,
+                ))));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                tracing::debug!("Will use LowLatency transport!");
+                TransportUnicastLowlatency::make(
+                    self.clone(),
+                    config.clone(),
+                    #[cfg(feature = "shared-memory")]
+                    shm_context,
+                    #[cfg(feature = "stats")]
+                    stats,
+                )
+            }
         } else {
             tracing::debug!("Will use Universal transport!");
             link_error!(
@@ -897,30 +916,16 @@ impl TransportManager {
         };
 
         // Open the link
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            tokio::time::timeout(self.config.unicast.open_timeout, async {
-                match manager.new_link(endpoint.clone()).await {
-                    Ok(link) => {
-                        super::establishment::open::open_link(endpoint, link, self, expected_zid)
-                            .await
-                    }
-                    Err(e) => Err(e),
-                }
-            })
-            .await
-            .map_err(|e| zerror!("{e}"))?
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            // On WASM, tokio::time::timeout is not available; run without timeout
+        zenoh_runtime::compat::timeout(self.config.unicast.open_timeout, async {
             match manager.new_link(endpoint.clone()).await {
                 Ok(link) => {
                     super::establishment::open::open_link(endpoint, link, self, expected_zid).await
                 }
                 Err(e) => Err(e),
             }
-        }
+        })
+        .await
+        .map_err(|e| zerror!("{e}"))?
     }
 
     pub async fn get_transport_unicast(&self, peer: &ZenohIdProto) -> Option<TransportUnicast> {
@@ -978,25 +983,17 @@ impl TransportManager {
         let c_manager = self.clone();
         self.task_controller
             .spawn_with_rt(zenoh_runtime::ZRuntime::Acceptor, async move {
-                #[cfg(not(target_arch = "wasm32"))]
+                if zenoh_runtime::compat::timeout(
+                    c_manager.config.unicast.accept_timeout,
+                    super::establishment::accept::accept_link(link, &c_manager),
+                )
+                .await
+                .is_err()
                 {
-                    if tokio::time::timeout(
-                        c_manager.config.unicast.accept_timeout,
-                        super::establishment::accept::accept_link(link, &c_manager),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        tracing::debug!(
-                            "Failed to accept link before deadline ({}ms)",
-                            c_manager.config.unicast.accept_timeout.as_millis()
-                        );
-                    }
-                }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    // On WASM, tokio::time::timeout is not available; accept without timeout
-                    let _ = super::establishment::accept::accept_link(link, &c_manager).await;
+                    tracing::debug!(
+                        "Failed to accept link before deadline ({}ms)",
+                        c_manager.config.unicast.accept_timeout.as_millis()
+                    );
                 }
                 incoming_counter.fetch_sub(1, SeqCst);
             });

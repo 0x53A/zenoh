@@ -3,6 +3,35 @@ use zenoh_runtime::{wasm_yield, ZRuntime};
 wasm_bindgen_test_configure!(run_in_browser);
 
 #[wasm_bindgen_test(async)]
+async fn unsupported_low_latency_returns_an_error_without_panicking() {
+    let mut config = zenoh::Config::default();
+    config.insert_json5("transport/unicast/qos/enabled", "false").unwrap();
+    config.insert_json5("transport/unicast/lowlatency", "true").unwrap();
+    let error = zenoh::open(config).await.err().expect("unsupported transport must fail");
+    assert!(error.to_string().contains("Low-latency transport is not supported on WASM"));
+}
+
+#[wasm_bindgen_test(async)]
+async fn timeout_expires_and_drops_the_pending_operation() {
+    use std::{cell::Cell, rc::Rc, time::Duration};
+    struct Dropped(Rc<Cell<bool>>);
+    impl Drop for Dropped {
+        fn drop(&mut self) { self.0.set(true); }
+    }
+    let dropped = Rc::new(Cell::new(false));
+    let guard = Dropped(dropped.clone());
+    let started = wasm_yield::Instant::now();
+    let result = zenoh_runtime::compat::timeout(Duration::from_millis(20), async move {
+        let _guard = guard;
+        std::future::pending::<()>().await;
+    }).await;
+    assert!(result.is_err());
+    assert!(started.elapsed() >= Duration::from_millis(20));
+    assert!(dropped.get());
+    assert_eq!(zenoh_runtime::compat::timeout(Duration::ZERO, async { 42 }).await.unwrap(), 42);
+}
+
+#[wasm_bindgen_test(async)]
 async fn joining_a_pending_task_keeps_its_waker() {
     let handle = ZRuntime::Application.spawn(async {
         wasm_yield::sleep_ms(20).await;

@@ -162,7 +162,6 @@ impl StartConditions {
 }
 
 impl Runtime {
-    #[cfg(not(target_arch = "wasm32"))]
     fn warn_if_oneof(peer_group: &EndPoints) {
         if let EndPoints::Locators(group) = peer_group {
             if matches!(group.strategy, LocatorsStrategy::OneOf) {
@@ -175,11 +174,34 @@ impl Runtime {
     }
 
     pub async fn start(&mut self) -> ZResult<()> {
+        #[cfg(target_arch = "wasm32")]
+        return self.start_without_scouting().await;
+
+        #[cfg(not(target_arch = "wasm32"))]
         match self.whatami() {
             WhatAmI::Client => self.start_client().await,
             WhatAmI::Peer => self.start_peer().await,
             WhatAmI::Router => self.start_router().await,
         }
+    }
+
+    // Browser transports have no UDP scouting, but endpoint selection, retries
+    // and connection deadlines follow the same policy as native transports.
+    #[cfg(target_arch = "wasm32")]
+    async fn start_without_scouting(&self) -> ZResult<()> {
+        let (listeners, peers) = {
+            let guard = self.state.config.lock();
+            (
+                guard.listen().endpoints().get(self.whatami()).cloned().unwrap_or_default(),
+                guard.connect().endpoints().get(self.whatami()).cloned().unwrap_or_default(),
+            )
+        };
+        self.bind_listeners(&listeners).await?;
+        let client = self.whatami() == WhatAmI::Client;
+        if client && peers.is_empty() {
+            bail!("No peer specified and multicast scouting is not available on WASM!");
+        }
+        self.connect_peers(&peers, client).await
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -254,40 +276,6 @@ impl Runtime {
         }
     }
 
-    #[cfg(target_arch = "wasm32")]
-    async fn start_client(&self) -> ZResult<()> {
-        let (listeners, peers) = {
-            let guard = &self.state.config.lock();
-            (
-                guard
-                    .listen()
-                    .endpoints()
-                    .client()
-                    .unwrap_or(&vec![])
-                    .clone(),
-                guard
-                    .connect()
-                    .endpoints()
-                    .client()
-                    .unwrap_or(&vec![])
-                    .clone(),
-            )
-        };
-
-        self.bind_listeners(&listeners).await?;
-
-        if peers.is_empty() {
-            bail!("No peer specified and multicast scouting is not available on WASM!")
-        } else {
-            for peer_group in &peers {
-                for endpoint in peer_group.as_vec() {
-                    self.peer_connector(endpoint).await?;
-                }
-            }
-            Ok(())
-        }
-    }
-
     #[cfg(not(target_arch = "wasm32"))]
     async fn start_peer(&self) -> ZResult<()> {
         let (listeners, peers, scouting, wait_scouting, listen, autoconnect, addr, ifaces, delay) = {
@@ -330,30 +318,6 @@ impl Runtime {
         Ok(())
     }
 
-    #[cfg(target_arch = "wasm32")]
-    async fn start_peer(&self) -> ZResult<()> {
-        let (listeners, peers) = {
-            let guard = &self.state.config.lock();
-            (
-                guard.listen().endpoints().peer().unwrap_or(&vec![]).clone(),
-                guard
-                    .connect()
-                    .endpoints()
-                    .peer()
-                    .unwrap_or(&vec![])
-                    .clone(),
-            )
-        };
-
-        self.bind_listeners(&listeners).await?;
-        for peer_group in &peers {
-            for endpoint in peer_group.as_vec() {
-                self.peer_connector(endpoint).await?;
-            }
-        }
-        Ok(())
-    }
-
     #[cfg(not(target_arch = "wasm32"))]
     async fn start_router(&self) -> ZResult<()> {
         let (listeners, peers, scouting, listen, autoconnect, addr, ifaces, delay) = {
@@ -389,35 +353,6 @@ impl Runtime {
         }
 
         tokio::time::sleep(delay).await;
-        Ok(())
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    async fn start_router(&self) -> ZResult<()> {
-        let (listeners, peers) = {
-            let guard = &self.state.config.lock();
-            (
-                guard
-                    .listen()
-                    .endpoints()
-                    .router()
-                    .unwrap_or(&vec![])
-                    .clone(),
-                guard
-                    .connect()
-                    .endpoints()
-                    .router()
-                    .unwrap_or(&vec![])
-                    .clone(),
-            )
-        };
-
-        self.bind_listeners(&listeners).await?;
-        for peer_group in &peers {
-            for endpoint in peer_group.as_vec() {
-                self.peer_connector(endpoint).await?;
-            }
-        }
         Ok(())
     }
 
@@ -473,36 +408,26 @@ impl Runtime {
         Ok(())
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     async fn connect_peers(&self, peers: &[EndPoints], single_link: bool) -> ZResult<()> {
         let timeout = self.get_global_connect_timeout();
         if timeout.is_zero() {
             self.connect_peers_impl(peers, single_link).await
         } else {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let res = tokio::time::timeout(timeout, async {
-                    self.connect_peers_impl(peers, single_link).await
-                })
-                .await;
-                match res {
-                    Ok(r) => r,
-                    Err(_) => {
-                        let e = zerror!("Unable to connect to any of {:?}. Timeout!", peers);
-                        tracing::warn!("{}", &e);
-                        Err(e.into())
-                    }
-                }
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                // On WASM, tokio::time is not available; connect without timeout
+            let res = zenoh_runtime::compat::timeout(timeout, async {
                 self.connect_peers_impl(peers, single_link).await
+            })
+            .await;
+            match res {
+                Ok(r) => r,
+                Err(_) => {
+                    let e = zerror!("Unable to connect to any of {:?}. Timeout!", peers);
+                    tracing::warn!("{}", &e);
+                    Err(e.into())
+                }
             }
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     async fn connect_peers_impl(&self, peers: &[EndPoints], single_link: bool) -> ZResult<()> {
         if single_link {
             self.connect_peers_single_link(peers).await
@@ -511,7 +436,6 @@ impl Runtime {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     async fn connect_peers_single_link(&self, peers: &[EndPoints]) -> ZResult<()> {
         let mut success_flag = false;
         for peer_group in peers {
@@ -561,7 +485,6 @@ impl Runtime {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     async fn connect_peers_multiply_links(&self, peers: &[EndPoints]) -> ZResult<()> {
         for peer_group in peers {
             Self::warn_if_oneof(peer_group);
@@ -648,24 +571,12 @@ impl Runtime {
         if timeout.is_zero() {
             self.bind_listeners_impl(listeners).await
         } else {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let res = tokio::time::timeout(timeout, async {
-                    self.bind_listeners_impl(listeners).await.ok()
-                })
-                .await;
-                match res {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        tracing::error!("Unable to open listeners: {}", e);
-                        Err(Box::new(e))
-                    }
+            match zenoh_runtime::compat::timeout(timeout, self.bind_listeners_impl(listeners)).await {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::error!("Unable to open listeners: {}", error);
+                    Err(Box::new(error))
                 }
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                // On WASM, tokio::time is not available; bind without timeout
-                self.bind_listeners_impl(listeners).await
             }
         }
     }
@@ -716,14 +627,7 @@ impl Runtime {
             if self.add_listener(listener.clone()).await.is_ok() {
                 break;
             }
-            #[cfg(not(target_arch = "wasm32"))]
-            tokio::time::sleep(period.next_duration()).await;
-            #[cfg(target_arch = "wasm32")]
-            {
-                let duration = period.next_duration();
-                let ms = duration.as_millis().min(u32::MAX as u128) as u32;
-                zenoh_runtime::wasm_yield::sleep_ms(ms).await;
-            }
+            zenoh_runtime::compat::sleep(period.next_duration()).await;
         }
     }
 
@@ -1033,28 +937,9 @@ impl Runtime {
             wait_time: Duration,
             cancellation_token: CancellationToken,
         ) -> Option<(EndPoint, ConnectionRetryPeriod)> {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                tokio::select! {
-                    _ = tokio::time::sleep(wait_time) => {
-                        Some((peer, period))
-                    }
-                    _ = cancellation_token.cancelled() => {
-                        None
-                    }
-                }
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                let wait_ms = wait_time.as_millis().min(u32::MAX as u128) as u32;
-                tokio::select! {
-                    _ = zenoh_runtime::wasm_yield::sleep_ms(wait_ms) => {
-                        Some((peer, period))
-                    }
-                    _ = cancellation_token.cancelled() => {
-                        None
-                    }
-                }
+            tokio::select! {
+                _ = zenoh_runtime::compat::sleep(wait_time) => Some((peer, period)),
+                _ = cancellation_token.cancelled() => None,
             }
         }
 

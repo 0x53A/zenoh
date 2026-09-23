@@ -1109,7 +1109,7 @@ impl TransportEventHandler for RuntimeTransportEventHandler {
                     let transports = runtime.manager().get_transports_unicast_blocking();
 
                     #[cfg(not(target_arch = "wasm32"))]
-                    let transports = zenoh_runtime::ZRuntime::Net
+                    let transports = zenoh_runtime::ZRuntime::Application
                         .block_in_place(runtime.manager().get_transports_unicast());
 
                     transports

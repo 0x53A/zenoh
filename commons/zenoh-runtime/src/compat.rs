@@ -12,28 +12,42 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
-//! Platform compatibility layer.
-//!
-//! Re-exports async primitives that work on both native (tokio) and WASM targets.
-//! Transport code should use these instead of importing tokio directly.
-
-// --- Async Mutex / RwLock ---
+//! Runtime-dependent timers shared by native and browser transports.
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, RwLock as AsyncRwLock};
+pub use tokio::time::{sleep, timeout};
 
-// With wasm-threads (SharedArrayBuffer), use tokio::sync::Mutex which
-// works correctly with cross-worker waking and block_in_place.
-// Without wasm-threads, futures::lock::Mutex is fine for single-threaded.
-#[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
-pub use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
-
-#[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
-pub use futures::lock::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
-
-// futures doesn't have RwLock — on WASM, use std's.
-// With wasm-threads (SharedArrayBuffer), std::sync::RwLock uses real atomics.
-// This is safe because AsyncRwLock is only used in native-only link crates
-// (serial, vsock, unixsock, native ws) which don't compile on WASM.
 #[cfg(target_arch = "wasm32")]
-pub use std::sync::RwLock as AsyncRwLock;
+pub use crate::wasm_yield::sleep;
+
+/// The operation did not complete within its deadline.
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug)]
+pub struct Elapsed;
+
+#[cfg(target_arch = "wasm32")]
+impl std::fmt::Display for Elapsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("deadline has elapsed")
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl std::error::Error for Elapsed {}
+
+/// Apply a deadline without requiring Tokio's timer driver.
+/// Dropping the timeout also drops the operation and its timer.
+#[cfg(target_arch = "wasm32")]
+pub async fn timeout<F: std::future::Future>(
+    duration: std::time::Duration,
+    future: F,
+) -> Result<F::Output, Elapsed> {
+    use futures::FutureExt;
+    let future = future.fuse();
+    let timer = sleep(duration).fuse();
+    futures::pin_mut!(future, timer);
+    futures::select_biased! {
+        value = future => Ok(value),
+        _ = timer => Err(Elapsed),
+    }
+}
