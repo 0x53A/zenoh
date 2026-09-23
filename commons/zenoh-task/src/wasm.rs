@@ -14,126 +14,24 @@
 
 //! WASM implementation of task management.
 //!
-//! On WASM there are no threads and no tokio runtime.
-//! We provide API-compatible types that use spawn_local and simple cancellation.
+//! Uses the browser/worker runtime and runtime-independent cancellation tokens.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::FutureExt;
 use zenoh_runtime::{JoinHandle, ZRuntime};
 
-/// A simple cancellation token for WASM, API-compatible with tokio_util's CancellationToken.
-#[derive(Clone)]
-pub struct CancellationToken {
-    inner: Arc<CancellationTokenInner>,
-}
+// CancellationToken uses synchronization primitives only; it needs no Tokio
+// runtime. Keep native cancellation, child-token and waiter-drop semantics.
+pub use tokio_util::sync::CancellationToken;
 
-struct CancellationTokenInner {
-    cancelled: AtomicBool,
-    /// Stores one waker per CancelledFuture instance (keyed by index).
-    /// Replaces wakers on re-poll instead of accumulating duplicates.
-    wakers: Mutex<Vec<Option<std::task::Waker>>>,
-}
-
-impl CancellationToken {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(CancellationTokenInner {
-                cancelled: AtomicBool::new(false),
-                wakers: Mutex::new(Vec::new()),
-            }),
-        }
-    }
-
-    pub fn cancel(&self) {
-        self.inner.cancelled.store(true, Ordering::SeqCst);
-        // Wake all waiting futures
-        if let Ok(mut wakers) = self.inner.wakers.lock() {
-            for waker in wakers.iter_mut().filter_map(|w| w.take()) {
-                waker.wake();
-            }
-        }
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.inner.cancelled.load(Ordering::SeqCst)
-    }
-
-    pub fn child_token(&self) -> CancellationToken {
-        self.clone()
-    }
-
-    /// Returns a future that completes when the token is cancelled.
-    pub fn cancelled(&self) -> CancelledFuture {
-        // Allocate a slot in the waker vec for this future
-        let slot = if let Ok(mut wakers) = self.inner.wakers.lock() {
-            let idx = wakers.len();
-            wakers.push(None);
-            idx
-        } else {
-            0
-        };
-        CancelledFuture {
-            inner: self.inner.clone(),
-            slot,
-        }
-    }
-
-    /// Runs a future until this token is cancelled (owned version).
-    pub fn run_until_cancelled_owned<F: Future + Send>(
-        &self,
-        future: F,
-    ) -> impl Future<Output = Option<F::Output>> + Send {
-        let inner = self.inner.clone();
-        async move {
-            if inner.cancelled.load(Ordering::SeqCst) {
-                return None;
-            }
-            Some(future.await)
-        }
-    }
-
-    /// Runs a future until this token is cancelled (reference version).
-    pub async fn run_until_cancelled<F: Future>(&self, future: F) -> Option<F::Output> {
-        if self.inner.cancelled.load(Ordering::SeqCst) {
-            return None;
-        }
-        Some(future.await)
-    }
-}
-
-impl Default for CancellationToken {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub struct CancelledFuture {
-    inner: Arc<CancellationTokenInner>,
-    slot: usize,
-}
-
-impl Future for CancelledFuture {
-    type Output = ();
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<()> {
-        if self.inner.cancelled.load(Ordering::SeqCst) {
-            std::task::Poll::Ready(())
-        } else {
-            // Replace the waker in our dedicated slot (no accumulation)
-            if let Ok(mut wakers) = self.inner.wakers.lock() {
-                if let Some(entry) = wakers.get_mut(self.slot) {
-                    *entry = Some(cx.waker().clone());
-                }
-            }
-            std::task::Poll::Pending
-        }
+struct TaskCountGuard(Arc<AtomicUsize>);
+impl Drop for TaskCountGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -177,11 +75,10 @@ impl TaskController {
         let count = self.task_count.clone();
         count.fetch_add(1, Ordering::SeqCst);
         let abortable = self.into_abortable(future);
-        let count2 = count.clone();
+        let completed = TaskCountGuard(count);
         ZRuntime::Application.spawn(async move {
-            let result = abortable.await;
-            count2.fetch_sub(1, Ordering::SeqCst);
-            result
+            let _completed = completed;
+            abortable.await
         })
     }
 
@@ -193,11 +90,10 @@ impl TaskController {
         let count = self.task_count.clone();
         count.fetch_add(1, Ordering::SeqCst);
         let abortable = self.into_abortable(future);
-        let count2 = count.clone();
+        let completed = TaskCountGuard(count);
         rt.spawn(async move {
-            let result = abortable.await;
-            count2.fetch_sub(1, Ordering::SeqCst);
-            result
+            let _completed = completed;
+            abortable.await
         })
     }
 
@@ -212,11 +108,10 @@ impl TaskController {
     {
         let count = self.task_count.clone();
         count.fetch_add(1, Ordering::SeqCst);
-        let count2 = count.clone();
+        let completed = TaskCountGuard(count);
         ZRuntime::Application.spawn(async move {
-            let result = future.await;
-            count2.fetch_sub(1, Ordering::SeqCst);
-            result
+            let _completed = completed;
+            future.await
         })
     }
 
@@ -227,23 +122,31 @@ impl TaskController {
     {
         let count = self.task_count.clone();
         count.fetch_add(1, Ordering::SeqCst);
-        let count2 = count.clone();
+        let completed = TaskCountGuard(count);
         rt.spawn(async move {
-            let result = future.await;
-            count2.fetch_sub(1, Ordering::SeqCst);
-            result
+            let _completed = completed;
+            future.await
         })
     }
 
-    pub fn terminate_all(&self, _timeout: Duration) -> usize {
+    /// Cancel all tasks and return the number still running.
+    /// Compute workers wait up to `timeout`; JS event-loop threads cannot block
+    /// and return immediately. Use async termination to wait on those threads.
+    pub fn terminate_all(&self, timeout: Duration) -> usize {
         self.token.cancel();
+        if zenoh_runtime::has_local_executor() {
+            ZRuntime::Application.block_in_place(async {
+                wait_with_timeout(self.terminate_all_async(), timeout).await;
+            });
+        }
         self.task_count.load(Ordering::SeqCst)
     }
 
     pub async fn terminate_all_async(&self) {
         self.token.cancel();
-        // On WASM we can't truly wait for tasks to complete
-        // since there's no join mechanism for spawn_local tasks
+        while self.task_count.load(Ordering::SeqCst) != 0 {
+            zenoh_runtime::wasm_yield::sleep_ms(1).await;
+        }
     }
 }
 
@@ -304,15 +207,40 @@ impl TerminatableTask {
         }
     }
 
-    pub fn terminate(&mut self, _timeout: Duration) -> bool {
+    /// Cancel and report whether the task has actually finished.
+    /// Compute workers wait up to `timeout`; JS event-loop threads return the
+    /// current status immediately. A false result keeps the handle for retry.
+    pub fn terminate(&mut self, timeout: Duration) -> bool {
         self.token.cancel();
-        true
+        if zenoh_runtime::has_local_executor() {
+            ZRuntime::Application.block_in_place(self.terminate_async_timeout(timeout))
+        } else {
+            self.handle.as_ref().is_none_or(JoinHandle::is_finished)
+        }
+    }
+
+    /// Cancel and wait for completion, retaining the handle if the wait times out.
+    pub async fn terminate_async_timeout(&mut self, timeout: Duration) -> bool {
+        wait_with_timeout(self.terminate_async(), timeout).await
     }
 
     pub async fn terminate_async(&mut self) {
         self.token.cancel();
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = self.handle.as_mut() {
             let _ = handle.await;
         }
+        // Do not take the handle until the join completes: dropping this wait
+        // (including a timeout) must leave a subsequent join possible.
+        self.handle = None;
+    }
+}
+
+async fn wait_with_timeout(future: impl Future<Output = ()>, timeout: Duration) -> bool {
+    let completion = future.fuse();
+    let deadline = zenoh_runtime::wasm_yield::sleep(timeout).fuse();
+    futures::pin_mut!(completion, deadline);
+    futures::select_biased! {
+        _ = completion => true,
+        _ = deadline => false,
     }
 }

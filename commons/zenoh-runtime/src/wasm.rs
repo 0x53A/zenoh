@@ -63,44 +63,38 @@ impl std::fmt::Display for ZRuntime {
 }
 
 /// A handle to a spawned task, API-compatible with tokio's JoinHandle.
-pub struct JoinHandle<T> {
+pub struct JoinHandle<T: 'static> {
     rx: flume::Receiver<T>,
+    abort: futures::future::AbortHandle,
+    fut: flume::r#async::RecvFut<'static, T>,
 }
 
-impl<T> std::fmt::Debug for JoinHandle<T> {
+impl<T: 'static> std::fmt::Debug for JoinHandle<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JoinHandle").finish()
     }
 }
 
-impl<T> Future for JoinHandle<T> {
+impl<T: 'static> Future for JoinHandle<T> {
     type Output = Result<T, JoinError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.rx.try_recv() {
-            Ok(val) => Poll::Ready(Ok(val)),
-            Err(flume::TryRecvError::Empty) => {
-                let rx = self.rx.clone();
-                let mut fut = Box::pin(async move { rx.recv_async().await });
-                match fut.as_mut().poll(cx) {
-                    Poll::Ready(Ok(val)) => Poll::Ready(Ok(val)),
-                    Poll::Ready(Err(_)) => Poll::Ready(Err(JoinError)),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
-            Err(flume::TryRecvError::Disconnected) => Poll::Ready(Err(JoinError)),
+        match Pin::new(&mut self.get_mut().fut).poll(cx) {
+            Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(JoinError)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
-impl<T> JoinHandle<T> {
+impl<T: 'static> JoinHandle<T> {
     pub fn abort(&self) {
-        // Cannot abort tasks on WASM — spawn_local tasks run to completion
+        self.abort.abort();
     }
 
     pub fn is_finished(&self) -> bool {
         // If we can peek without consuming, the task is done
-        !self.rx.is_empty()
+        !self.rx.is_empty() || self.rx.is_disconnected()
     }
 }
 
@@ -136,11 +130,18 @@ impl ZRuntime {
         F::Output: 'static,
     {
         let (tx, rx) = flume::bounded(1);
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        let future = futures::future::Abortable::new(future, registration);
         wasm_bindgen_futures::spawn_local(async move {
-            let result = future.await;
-            let _ = tx.send(result);
+            if let Ok(result) = future.await {
+                let _ = tx.send(result);
+            }
         });
-        JoinHandle { rx }
+        JoinHandle {
+            fut: rx.clone().into_recv_async(),
+            rx,
+            abort,
+        }
     }
 
     /// On WASM, `block_in_place` cannot truly block.
@@ -195,3 +196,6 @@ pub struct ZRuntimePoolGuard;
 impl Drop for ZRuntimePoolGuard {
     fn drop(&mut self) {}
 }
+
+/// Single-threaded browsers have no dedicated compute worker.
+pub fn current_runtime() -> Option<ZRuntime> { None }

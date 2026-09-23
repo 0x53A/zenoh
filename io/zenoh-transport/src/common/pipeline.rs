@@ -56,6 +56,22 @@ use super::{
 };
 use crate::common::batch::BatchConfig;
 
+// JS event loops cannot park, and TX cannot wait for a producer that needs TX
+// to return a batch. Apply this to *all* publishing locks, before any refill wait.
+fn lock_for_publish<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    #[cfg(target_arch = "wasm32")]
+    if !zenoh_runtime::has_local_executor()
+        || zenoh_runtime::current_runtime() == Some(zenoh_runtime::ZRuntime::TX)
+    {
+        return match mutex.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(error)) => panic!("pipeline mutex poisoned: {error}"),
+        };
+    }
+    Some(zlock!(mutex))
+}
+
 // Batches are moved all over the pipeline and are quite big (56B+), so they are boxed to optimize
 // the moves. They are always reused, so there is no allocation performance penalty.
 type BoxedWBatch = Box<WBatch>;
@@ -98,8 +114,7 @@ impl StageInRefill {
 
     #[cfg(target_arch = "wasm32")]
     fn wait(&self) -> bool {
-        // On WASM, blocking wait is not available; just return false to skip waiting
-        false
+        self.wait_refill(None).unwrap_or(false)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -112,9 +127,54 @@ impl StageInRefill {
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn wait_deadline(&self, _instant: Instant) -> Result<bool, TransportClosed> {
-        // On WASM, blocking wait_deadline is not available; return as if deadline expired
-        Ok(false)
+    fn wait_deadline(&self, instant: Instant) -> Result<bool, TransportClosed> {
+        self.wait_refill(Some(instant))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn wait_refill(&self, deadline: Option<Instant>) -> Result<bool, TransportClosed> {
+        // Only compute workers may block. TX returns batches on its separate
+        // worker; the JavaScript socket owner must keep servicing its event loop.
+        if !zenoh_runtime::has_local_executor() || zenoh_runtime::current_runtime() == Some(zenoh_runtime::ZRuntime::TX) { return Ok(false); }
+        use std::{future::Future, sync::Condvar, task::{Context, Poll, Wake, Waker}};
+        struct Ready { flag: Mutex<bool>, changed: Condvar }
+        impl Wake for Ready {
+            fn wake(self: Arc<Self>) { self.wake_by_ref(); }
+            fn wake_by_ref(self: &Arc<Self>) {
+                // This short critical section also permits wakes from JS threads.
+                let mut flag = loop {
+                    if let Ok(flag) = self.flag.try_lock() { break flag; }
+                    std::hint::spin_loop();
+                };
+                *flag = true;
+                self.changed.notify_one();
+            }
+        }
+        let ready = Arc::new(Ready { flag: Mutex::new(false), changed: Condvar::new() });
+        let waker = Waker::from(ready.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut notified = std::pin::pin!(self.n_ref_r.wait_async());
+        loop {
+            *ready.flag.lock().unwrap() = false;
+            match notified.as_mut().poll(&mut context) {
+                Poll::Ready(result) => return result.map(|()| true).map_err(|_| TransportClosed),
+                Poll::Pending => {},
+            }
+            let remaining = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() { return Ok(false); }
+                    remaining
+                }
+                None => Duration::from_secs(60),
+            };
+            let flag = ready.flag.lock().unwrap();
+            if !*flag {
+                // Never pump unrelated tasks under the pipeline serialization
+                // lock: a nested publisher would deadlock acquiring that lock.
+                let _ = ready.changed.wait_timeout(flag, remaining).unwrap();
+            }
+        }
     }
 }
 
@@ -183,11 +243,11 @@ struct StageInMutex {
 
 impl StageInMutex {
     #[inline]
-    fn channel(&self, is_reliable: bool) -> MutexGuard<'_, TransportChannelTx> {
+    fn channel(&self, is_reliable: bool) -> Option<MutexGuard<'_, TransportChannelTx>> {
         if is_reliable {
-            zlock!(self.priority.reliable)
+            lock_for_publish(&self.priority.reliable)
         } else {
-            zlock!(self.priority.best_effort)
+            lock_for_publish(&self.priority.best_effort)
         }
     }
 }
@@ -318,7 +378,7 @@ impl StageIn {
         deadline: &mut Deadline,
     ) -> Result<bool, TransportClosed> {
         // Lock the current serialization batch.
-        let mut c_guard = zlock!(self.mutex.current);
+        let Some(mut c_guard) = lock_for_publish(&self.mutex.current) else { return Ok(false); };
         c_guard.notify_pending();
 
         macro_rules! zgetbatch_rets {
@@ -379,7 +439,12 @@ impl StageIn {
         };
 
         // Lock the channel. We are the only one that will be writing on it.
-        let mut tch = self.mutex.channel(msg.is_reliable());
+        let Some(mut tch) = self.mutex.channel(msg.is_reliable()) else {
+            // No sequence number was consumed. Restore the owned batch so a
+            // failed nonblocking publish cannot exhaust the reusable batch pool.
+            c_guard.batch = Some(batch);
+            return Ok(false);
+        };
 
         // Retrieve the next SN
         let sn = tch.sn.get();
@@ -482,7 +547,7 @@ impl StageIn {
     #[inline]
     fn push_transport_message(&mut self, msg: TransportMessage) -> bool {
         // Lock the current serialization batch.
-        let mut c_guard = zlock!(self.mutex.current);
+        let Some(mut c_guard) = lock_for_publish(&self.mutex.current) else { return false; };
         c_guard.notify_pending();
 
         macro_rules! zgetbatch_rets {
@@ -916,7 +981,7 @@ impl TransmissionPipelineProducer {
         };
         let mut deadline = Deadline::new(wait_time, max_wait_time);
         // Lock the channel. We are the only one that will be writing on it.
-        let mut queue = zlock!(self.stage_in[idx]);
+        let Some(mut queue) = lock_for_publish(&self.stage_in[idx]) else { return Ok(false); };
         // Check again for congestion in case it happens when blocking on the mutex.
         if msg.is_droppable() && self.status.is_congested(priority) {
             return Ok(false);
@@ -955,7 +1020,7 @@ impl TransmissionPipelineProducer {
             0
         };
         // Lock the channel. We are the only one that will be writing on it.
-        let mut queue = zlock!(self.stage_in[priority]);
+        let Some(mut queue) = lock_for_publish(&self.stage_in[priority]) else { return false; };
         queue.push_transport_message(msg)
     }
 
@@ -1576,3 +1641,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(all(target_arch="wasm32", feature="test"))]
+#[path="wasm_refill_tests.rs"]
+pub(crate) mod wasm_refill_tests;

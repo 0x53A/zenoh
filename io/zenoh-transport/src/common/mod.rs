@@ -18,3 +18,7 @@ pub(crate) mod priority;
 pub(crate) mod seq_num;
 #[cfg(feature = "shared-memory")]
 pub mod shm;
+
+#[cfg(all(target_arch="wasm32", feature="test"))]
+#[doc(hidden)]
+pub use pipeline::wasm_refill_tests::test_wasm_refill;

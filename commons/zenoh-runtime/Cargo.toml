@@ -42,9 +42,11 @@ js-sys = "0.3"
 tokio = { workspace = true, default-features = false, features = ["sync"] }
 web-sys = { version = "0.3", features = [
   "Worker", "WorkerOptions", "WorkerType", "DedicatedWorkerGlobalScope",
-  "Blob", "BlobPropertyBag", "Url",
+  "Blob", "BlobPropertyBag", "Url", "Performance",
 ] }
-flume = { workspace = true }
+# Main/Acceptor threads cannot use Atomics.wait when a channel mutex contends.
+# Feature unification applies the spin-based channel lock throughout WASM.
+flume = { workspace = true, features = ["spin"] }
 futures = { workspace = true }
 
 [package.metadata.cargo-machete]

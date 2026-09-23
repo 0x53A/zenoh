@@ -120,6 +120,8 @@ impl LinkKind {
                 UNIXSOCKSTREAM_LOCATOR_PREFIX => supported_links.push(LinkKind::UnixsockStream),
                 #[cfg(feature = "transport_ws")]
                 WS_LOCATOR_PREFIX => supported_links.push(LinkKind::Ws),
+                #[cfg(all(feature = "transport_ws", target_arch = "wasm32"))]
+                "wss" => supported_links.push(LinkKind::Ws),
                 #[cfg(feature = "transport_serial")]
                 SERIAL_LOCATOR_PREFIX => supported_links.push(LinkKind::Serial),
                 #[cfg(feature = "transport_unixpipe")]
@@ -174,6 +176,8 @@ impl TryFrom<&Locator> for LinkKind {
             UNIXSOCKSTREAM_LOCATOR_PREFIX => Ok(LinkKind::UnixsockStream),
             #[cfg(feature = "transport_ws")]
             WS_LOCATOR_PREFIX => Ok(LinkKind::Ws),
+            #[cfg(all(feature = "transport_ws", target_arch = "wasm32"))]
+            "wss" => Ok(LinkKind::Ws),
             #[cfg(feature = "transport_serial")]
             SERIAL_LOCATOR_PREFIX => Ok(LinkKind::Serial),
             #[cfg(feature = "transport_unixpipe")]

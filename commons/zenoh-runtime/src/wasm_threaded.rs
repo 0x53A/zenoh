@@ -27,8 +27,8 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::task::{Context, Poll, Wake};
+use std::sync::OnceLock;
+use std::task::{Context, Poll};
 
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
@@ -100,9 +100,11 @@ impl ZRuntime {
 /// A handle to a spawned task, API-compatible with tokio's JoinHandle.
 pub struct JoinHandle<T> {
     rx: flume::Receiver<T>,
+    abort: futures::future::AbortHandle,
     /// Persistent recv future so the flume waker registration survives
     /// across polls (recreating it each poll would deregister the waker on drop).
     fut: Option<Pin<Box<dyn Future<Output = Result<T, flume::RecvError>> + Send + Sync>>>,
+    repoll: Option<RepollTimer>,
 }
 
 impl<T> std::fmt::Debug for JoinHandle<T> {
@@ -117,15 +119,19 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         match this.rx.try_recv() {
-            Ok(val) => return Poll::Ready(Ok(val)),
-            Err(flume::TryRecvError::Disconnected) => return Poll::Ready(Err(JoinError)),
+            Ok(val) => { this.repoll = None; return Poll::Ready(Ok(val)); },
+            Err(flume::TryRecvError::Disconnected) => { this.repoll = None; return Poll::Ready(Err(JoinError)); },
             Err(flume::TryRecvError::Empty) => {}
         }
         if THREADED_MODE.load(Ordering::Acquire) && !has_local_executor() {
             // JS thread (main or Acceptor) in threaded mode: the result arrives
-            // from another worker, whose flume wake can't reach this thread's
-            // microtask queue. Self-repoll via setTimeout.
-            schedule_waker_repoll(cx.waker().clone());
+            // from another worker, which may depend on browser cross-worker wake support.
+            // Keep the existing timer-based compatibility path bounded and owned.
+            let timer = this.repoll.get_or_insert_with(RepollTimer::new);
+            if Pin::new(timer).poll(cx).is_ready() {
+                this.repoll = None;
+                cx.waker().wake_by_ref();
+            }
             return Poll::Pending;
         }
         // Compute worker (Condvar-backed waker, cross-thread safe) or
@@ -142,31 +148,41 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
     }
 }
 
-/// Schedule a waker to fire after yielding to the JS event loop.
-/// Uses `setTimeout(1)` (browsers clamp to ~1-4ms) to re-poll on the current
-/// thread. This bridges cross-worker flume channels and per-thread JS event
-/// loops. `once_into_js` hands ownership to JS — freed after the call, no leak.
-fn schedule_waker_repoll(waker: std::task::Waker) {
-    use wasm_bindgen::closure::Closure;
-    let cb = Closure::once_into_js(move || {
-        waker.wake();
-    });
-    set_timeout(cb.unchecked_ref(), 1);
-}
-
+// Repoll timers belong to the waiting future. Shared-select wakers may poll
+// several branches repeatedly before a timer fires; rescheduling on every poll
+// creates an unbounded backlog instead of a wakeup bridge.
+static REPOLL_PENDING: AtomicU32 = AtomicU32::new(0);
+static REPOLL_PEAK: AtomicU32 = AtomicU32::new(0);
 #[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_name = "setTimeout")]
-    fn set_timeout(f: &js_sys::Function, millis: i32);
+#[doc(hidden)]
+pub fn __zenoh_repoll_counts() -> js_sys::Array {
+    js_sys::Array::of2(&JsValue::from(REPOLL_PENDING.load(Ordering::Relaxed)), &JsValue::from(REPOLL_PEAK.load(Ordering::Relaxed)))
+}
+struct RepollTimer(crate::wasm_yield::Sleep);
+impl RepollTimer {
+    fn new() -> Self {
+        let pending=REPOLL_PENDING.fetch_add(1,Ordering::Relaxed)+1;
+        REPOLL_PEAK.fetch_max(pending,Ordering::Relaxed);
+        Self(crate::wasm_yield::sleep_ms(1))
+    }
+}
+impl Future for RepollTimer {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        Pin::new(&mut self.0).poll(cx)
+    }
+}
+impl Drop for RepollTimer {
+    fn drop(&mut self) { REPOLL_PENDING.fetch_sub(1,Ordering::Relaxed); }
 }
 
 impl<T> JoinHandle<T> {
     pub fn abort(&self) {
-        // Cannot abort spawned tasks on WASM workers
+        self.abort.abort();
     }
 
     pub fn is_finished(&self) -> bool {
-        !self.rx.is_empty()
+        !self.rx.is_empty() || self.rx.is_disconnected()
     }
 }
 
@@ -183,23 +199,6 @@ impl std::fmt::Display for JoinError {
 impl std::error::Error for JoinError {}
 
 // ---------------------------------------------------------------------------
-// Condvar-based waker for block_in_place
-// ---------------------------------------------------------------------------
-
-struct CondvarWaker {
-    woken: Mutex<bool>,
-    cvar: Condvar,
-}
-
-impl Wake for CondvarWaker {
-    fn wake(self: Arc<Self>) {
-        let mut woken = self.woken.lock().unwrap();
-        *woken = true;
-        self.cvar.notify_one();
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Worker pool
 // ---------------------------------------------------------------------------
 
@@ -209,16 +208,25 @@ type BoxedTask = Box<dyn FnOnce() + Send>;
 
 struct WorkerHandle {
     task_tx: flume::Sender<BoxedTask>,
-    _worker: SendWrapper<web_sys::Worker>,
 }
 
-/// Wrapper to make JsValue-based types Send+Sync on WASM.
-/// SAFETY: Web Workers are thread-affine — the wrapped JS object is only
-/// accessed from the creating thread. With shared memory, this pattern
-/// remains valid as long as we don't call JS methods from other workers.
-struct SendWrapper<T>(T);
-unsafe impl<T> Send for SendWrapper<T> {}
-unsafe impl<T> Sync for SendWrapper<T> {}
+// JS handles and callbacks stay on the thread that created the workers.
+struct WorkerOwner {
+    _worker: web_sys::Worker,
+    _error: Closure<dyn FnMut(JsValue)>,
+    _message: Closure<dyn FnMut(JsValue)>,
+}
+thread_local! {
+    static WORKER_OWNERS: std::cell::RefCell<Vec<WorkerOwner>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// Startup errors are terminal: shared-memory workers cannot safely be killed
+// while holding a Rust lock. Reload the page to get a fresh WASM instance.
+static STARTUP_STARTED: AtomicBool = AtomicBool::new(false);
+static WORKER_FAILURE: OnceLock<String> = OnceLock::new();
+fn worker_failed(message: String) {
+    let _ = WORKER_FAILURE.set(message);
+}
 
 struct WorkerPool {
     workers: Vec<WorkerHandle>,
@@ -241,17 +249,15 @@ static TASK_RECEIVERS: OnceLock<Vec<flume::Receiver<BoxedTask>>> = OnceLock::new
 /// would never fire since the event loop is permanently blocked.
 ///
 /// The Acceptor (I/O worker) keeps its JS event loop alive for WebSocket
-/// callbacks. Its task drain uses setTimeout-based self-repolling, since
-/// JS microtask wakers cannot be triggered reliably from other threads.
+/// callbacks. Its task drain keeps the timer-based cross-worker compatibility path.
+/// Current atomic wasm-bindgen wakers also support cross-thread notifications.
 #[wasm_bindgen]
 pub fn __zenoh_worker_entry(variant_id: u32) {
+    WORKER_RUNTIME.with(|current| current.set(Some(ZRuntime::from_id(variant_id))));
     let receivers = TASK_RECEIVERS
         .get()
         .expect("Task receivers not initialized");
     let rx = receivers[variant_id as usize].clone();
-
-    // Signal that this worker is ready
-    WORKERS_READY.fetch_add(1, Ordering::Release);
 
     if variant_id == ZRuntime::Acceptor.variant_id() as u32 {
         // I/O worker: JS event loop stays alive for WebSocket callbacks.
@@ -263,6 +269,7 @@ pub fn __zenoh_worker_entry(variant_id: u32) {
                 }
             }
         });
+        WORKERS_READY.fetch_add(1, Ordering::Release);
     } else {
         // Compute worker: pure-Rust executor owns this thread from here on.
         let executor = std::rc::Rc::new(crate::executor::LocalExecutor::new());
@@ -277,8 +284,18 @@ pub fn __zenoh_worker_entry(variant_id: u32) {
                 }
             }
         });
+        WORKERS_READY.fetch_add(1, Ordering::Release);
         executor.run();
     }
+}
+
+thread_local! {
+    static WORKER_RUNTIME: std::cell::Cell<Option<ZRuntime>> = const { std::cell::Cell::new(None) };
+}
+
+/// Dedicated worker executing this code; None on the browser main thread.
+pub fn current_runtime() -> Option<ZRuntime> {
+    WORKER_RUNTIME.with(|current| current.get())
 }
 
 pub use crate::executor::has_local_executor;
@@ -299,8 +316,8 @@ pub fn spawn_on_current<F: Future<Output = ()> + 'static>(f: F) {
 ///
 /// - Compute workers: plain `recv_async` — the executor's wakers are
 ///   Condvar-backed and cross-thread safe.
-/// - Main thread / Acceptor in threaded mode: senders on other threads can't
-///   wake a JS microtask waker, so self-repoll via `setTimeout(1)`.
+/// - Main thread / Acceptor in threaded mode: retain a bounded `setTimeout(1)`
+///   compatibility bridge, owned by the waiting future.
 /// - Threaded mode inactive (single-threaded fallback): plain `recv_async` —
 ///   everything is on one thread.
 pub async fn recv_async_anywhere<T: Send + 'static>(
@@ -310,22 +327,17 @@ pub async fn recv_async_anywhere<T: Send + 'static>(
     if !needs_repoll {
         return rx.recv_async().await;
     }
-    std::future::poll_fn(|cx| match rx.try_recv() {
-        Ok(v) => Poll::Ready(Ok(v)),
-        Err(flume::TryRecvError::Disconnected) => Poll::Ready(Err(flume::RecvError::Disconnected)),
-        Err(flume::TryRecvError::Empty) => {
-            schedule_waker_repoll(cx.waker().clone());
-            Poll::Pending
+    loop {
+        match rx.try_recv() {
+            Ok(value) => return Ok(value),
+            Err(flume::TryRecvError::Disconnected) => return Err(flume::RecvError::Disconnected),
+            Err(flume::TryRecvError::Empty) => RepollTimer::new().await,
         }
-    })
-    .await
+    }
 }
 
-/// URL of the wasm-bindgen JS shim. Set during init, read by workers.
-static SHIM_URL: OnceLock<String> = OnceLock::new();
-
 impl WorkerPool {
-    fn new(shim_url: &str) -> Self {
+    fn new(shim_url: &str) -> Result<Self, JsValue> {
         // Create task channels for each worker
         let mut senders = Vec::with_capacity(NUM_WORKERS);
         let mut receivers = Vec::with_capacity(NUM_WORKERS);
@@ -343,25 +355,21 @@ impl WorkerPool {
         // Spawn Web Workers
         let mut workers = Vec::with_capacity(NUM_WORKERS);
         for (variant_id, tx) in senders.into_iter().enumerate() {
-            let worker = Self::spawn_worker(variant_id as u32, shim_url);
-            workers.push(WorkerHandle {
-                task_tx: tx,
-                _worker: SendWrapper(worker),
-            });
+            let owner = Self::spawn_worker(variant_id as u32, shim_url)?;
+            WORKER_OWNERS.with(|owners| owners.borrow_mut().push(owner));
+            workers.push(WorkerHandle { task_tx: tx });
         }
 
-        WorkerPool { workers }
+        Ok(WorkerPool { workers })
     }
 
     /// Resolve a potentially relative URL to an absolute one using the page's location.
-    fn resolve_url(url: &str) -> String {
-        js_sys::eval(&format!(
-            "new URL('{}', self.location.href).href",
-            url.replace('\'', "\\'")
-        ))
-        .ok()
-        .and_then(|v| v.as_string())
-        .unwrap_or_else(|| url.to_string())
+    fn resolve_url(url: &str) -> Result<String, JsValue> {
+        let location = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("location"))?;
+        let base = js_sys::Reflect::get(&location, &JsValue::from_str("href"))?
+            .as_string()
+            .ok_or_else(|| JsValue::from_str("location.href is unavailable"))?;
+        Ok(web_sys::Url::new_with_base(url, &base)?.href())
     }
 
     /// Spawn a Web Worker that shares our WASM module and linear memory.
@@ -371,41 +379,63 @@ impl WorkerPool {
     /// 2. Receives [module, memory, variant_id] via onmessage
     /// 3. Calls wasm_bindgen(module, memory) to init with shared memory
     /// 4. Calls __zenoh_worker_entry(variant_id) to start its event loop
-    fn spawn_worker(variant_id: u32, shim_url: &str) -> web_sys::Worker {
+    fn spawn_worker(variant_id: u32, shim_url: &str) -> Result<WorkerOwner, JsValue> {
         // Resolve to absolute URL — relative URLs don't work in Blob URL workers.
-        let abs_shim_url = Self::resolve_url(shim_url);
+        let abs_shim_url = Self::resolve_url(shim_url)?;
 
         // Worker JS: load the wasm-bindgen shim, then init with shared memory.
         // With +atomics, wasm_bindgen(module, memory) accepts two args —
         // the Module and the shared Memory (backed by SharedArrayBuffer).
+        let shim_literal = js_sys::JSON::stringify(&JsValue::from_str(&abs_shim_url))
+            .expect("a URL string can be serialized");
         let js_code = format!(
-            r#"importScripts('{}');
-self.onmessage = async function(e) {{
+            r#"self.onmessage = async function(e) {{
     const [module, memory, variant_id] = e.data;
     try {{
+        importScripts({});
         await wasm_bindgen(module, memory);
         wasm_bindgen.__zenoh_worker_entry(variant_id);
     }} catch(err) {{
-        console.error('[zenoh-worker:' + variant_id + '] error:', err);
+        self.postMessage({{ zenohWorkerError: String(err) }});
     }}
 }};"#,
-            abs_shim_url
+            shim_literal
+                .as_string()
+                .expect("JSON.stringify returns a string")
         );
 
         // Create a Blob URL for the worker script
         let blob = web_sys::Blob::new_with_str_sequence_and_options(
             &js_sys::Array::of1(&JsValue::from_str(&js_code)),
             web_sys::BlobPropertyBag::new().type_("application/javascript"),
-        )
-        .expect("Failed to create worker blob");
+        )?;
 
-        let url = web_sys::Url::create_object_url_with_blob(&blob)
-            .expect("Failed to create worker blob URL");
-
-        let worker = web_sys::Worker::new(&url).expect("Failed to create Web Worker");
+        let url = web_sys::Url::create_object_url_with_blob(&blob)?;
+        let result = web_sys::Worker::new(&url);
 
         // Clean up the blob URL (worker already has the script)
         let _ = web_sys::Url::revoke_object_url(&url);
+        let worker = result?;
+        let error = Closure::<dyn FnMut(JsValue)>::new(move |event: JsValue| {
+            let detail = js_sys::Reflect::get(&event, &JsValue::from_str("message"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "worker script failed".into());
+            worker_failed(format!("worker {variant_id}: {detail}"));
+        });
+        let message = Closure::<dyn FnMut(JsValue)>::new(move |event: JsValue| {
+            if let Ok(data) = js_sys::Reflect::get(&event, &JsValue::from_str("data")) {
+                if let Some(detail) =
+                    js_sys::Reflect::get(&data, &JsValue::from_str("zenohWorkerError"))
+                        .ok()
+                        .and_then(|v| v.as_string())
+                {
+                    worker_failed(format!("worker {variant_id}: {detail}"));
+                }
+            }
+        });
+        worker.set_onerror(Some(error.as_ref().unchecked_ref()));
+        worker.set_onmessage(Some(message.as_ref().unchecked_ref()));
 
         // Post the WASM module + shared memory + variant_id to the worker.
         // wasm_bindgen::module() returns the WebAssembly.Module.
@@ -415,11 +445,17 @@ self.onmessage = async function(e) {{
         init_data.push(&wasm_bindgen::memory());
         init_data.push(&JsValue::from(variant_id));
 
-        worker
-            .post_message(&init_data)
-            .expect("Failed to send init data to worker");
-
-        worker
+        if let Err(error_value) = worker.post_message(&init_data) {
+            worker.set_onerror(None);
+            worker.set_onmessage(None);
+            worker.terminate(); // No init message was sent: no shared Rust code runs here.
+            return Err(error_value);
+        }
+        Ok(WorkerOwner {
+            _worker: worker,
+            _error: error,
+            _message: message,
+        })
     }
 
     fn get(&self, rt: &ZRuntime) -> &WorkerHandle {
@@ -443,14 +479,17 @@ static THREADED_MODE: AtomicBool = AtomicBool::new(false);
 ///   Workers will load this via `importScripts()`.
 ///
 /// # Returns
-/// `true` if threaded mode was activated, `false` if falling back to single-threaded
+/// This legacy API reports dispatch only, not readiness. Prefer
+/// [`__zenoh_init_threaded_runtime_async`] and await it before spawning tasks.
+/// `true` if workers were dispatched, `false` if startup failed or falling back to single-threaded
 /// (e.g., SharedArrayBuffer not available due to missing COOP/COEP headers).
 #[wasm_bindgen]
 pub fn __zenoh_init_threaded_runtime(shim_url: &str) -> bool {
     // Check if SharedArrayBuffer is available
-    let sab_available = js_sys::eval("typeof SharedArrayBuffer !== 'undefined'")
-        .map(|v| v.as_bool().unwrap_or(false))
-        .unwrap_or(false);
+    let sab_available =
+        js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("SharedArrayBuffer"))
+            .map(|v| v.is_function())
+            .unwrap_or(false);
 
     if !sab_available {
         tracing::warn!(
@@ -460,14 +499,60 @@ pub fn __zenoh_init_threaded_runtime(shim_url: &str) -> bool {
         return false;
     }
 
-    let _ = SHIM_URL.set(shim_url.to_string());
-    WORKER_POOL.get_or_init(|| WorkerPool::new(shim_url));
-    THREADED_MODE.store(true, Ordering::Release);
-    tracing::info!(
-        "Zenoh threaded WASM runtime initialized with {} workers",
-        NUM_WORKERS
-    );
+    if WORKER_FAILURE.get().is_some() {
+        return false;
+    }
+    if STARTUP_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        match WorkerPool::new(shim_url) {
+            Ok(pool) => {
+                let _ = WORKER_POOL.set(pool);
+                THREADED_MODE.store(true, Ordering::Release);
+            }
+            Err(error) => {
+                worker_failed(format!("worker initialization failed: {error:?}"));
+                return false;
+            }
+        }
+    }
     true
+}
+
+/// Wait until all five workers have installed their task executors.
+/// Returns false only when SharedArrayBuffer is unavailable (single-threaded
+/// fallback). Script load, initialization and timeout failures reject with an
+/// explanatory error. Failure is terminal; reload the page before retrying.
+/// The timeout starts when this future is polled and includes worker dispatch.
+#[wasm_bindgen]
+pub async fn __zenoh_init_threaded_runtime_async(
+    shim_url: &str,
+    timeout_ms: u32,
+) -> Result<bool, JsValue> {
+    let started = crate::wasm_yield::Instant::now();
+    let dispatched = __zenoh_init_threaded_runtime(shim_url);
+    loop {
+        if let Some(error) = WORKER_FAILURE.get() {
+            return Err(JsValue::from_str(&format!(
+                "{error}; reload the page to retry"
+            )));
+        }
+        if !dispatched {
+            return Ok(false);
+        }
+        if WORKERS_READY.load(Ordering::Acquire) == NUM_WORKERS as u32 {
+            return Ok(true);
+        }
+        if started.elapsed() >= std::time::Duration::from_millis(timeout_ms.into()) {
+            worker_failed(format!(
+                "worker startup timed out after {timeout_ms} ms ({}/{NUM_WORKERS} ready)",
+                WORKERS_READY.load(Ordering::Acquire)
+            ));
+            continue;
+        }
+        crate::wasm_yield::sleep_ms(1).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -498,8 +583,13 @@ impl ZRuntime {
         F::Output: Send + 'static,
     {
         let (tx, rx) = flume::bounded(1);
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        let future = futures::future::Abortable::new(future, registration);
 
-        if THREADED_MODE.load(Ordering::Acquire) {
+        if WORKER_FAILURE.get().is_some() {
+            drop(future);
+            drop(tx);
+        } else if THREADED_MODE.load(Ordering::Acquire) {
             // Dispatch to the worker for this runtime variant. The closure runs
             // ON the target worker: compute workers spawn onto their
             // LocalExecutor, the Acceptor onto its JS microtask queue.
@@ -507,8 +597,9 @@ impl ZRuntime {
             let worker = pool.get(self);
             let task: BoxedTask = Box::new(move || {
                 spawn_on_current(async move {
-                    let result = future.await;
-                    let _ = tx.send(result);
+                    if let Ok(result) = future.await {
+                        let _ = tx.send(result);
+                    }
                 });
             });
             worker
@@ -518,93 +609,42 @@ impl ZRuntime {
         } else {
             // Fallback: single-threaded mode (same as old wasm.rs)
             wasm_bindgen_futures::spawn_local(async move {
-                let result = future.await;
-                let _ = tx.send(result);
+                if let Ok(result) = future.await {
+                    let _ = tx.send(result);
+                }
             });
         }
 
-        JoinHandle { rx, fut: None }
+        JoinHandle {
+            rx,
+            abort,
+            fut: None,
+            repoll: None,
+        }
     }
 
-    /// Block the current worker until the future completes.
+    /// Drive a future synchronously on a compute worker, pumping its executor.
     ///
-    /// In threaded mode, uses `Condvar::wait` which compiles to `memory.atomic.wait32`
-    /// — real OS-level blocking. The waker is called from whichever worker completes
-    /// the async work.
-    ///
-    /// **Must not be called from the main browser thread** — `Atomics.wait()` is
-    /// disallowed there. All zenoh usage should run from worker contexts.
-    ///
-    /// In single-threaded fallback mode, polls once and panics if Pending.
+    /// On the main thread or the Acceptor worker, only immediately ready futures
+    /// are supported: waiting would prevent JS events from making progress.
     #[track_caller]
     pub fn block_in_place<F, R>(&self, f: F) -> R
     where
         F: Future<Output = R>,
     {
-        if !THREADED_MODE.load(Ordering::Acquire) {
-            // Fallback: single-poll mode (same as old wasm.rs)
-            let mut f = std::pin::pin!(f);
-            let cv = Arc::new(CondvarWaker {
-                woken: Mutex::new(false),
-                cvar: Condvar::new(),
-            });
-            let waker: std::task::Waker = cv.into();
-            let mut cx = Context::from_waker(&waker);
-            match f.as_mut().poll(&mut cx) {
-                Poll::Ready(result) => return result,
-                Poll::Pending => {
-                    let caller = std::panic::Location::caller();
-                    panic!(
-                        "block_in_place: future returned Pending on WASM (single-threaded fallback) \
-                         — cannot block (called from {}:{}:{}). \
-                         Enable wasm-threads with SharedArrayBuffer for real blocking.",
-                        caller.file(),
-                        caller.line(),
-                        caller.column()
-                    )
-                }
-            }
-        }
-
-        // Compute worker: block on the LocalExecutor, which pumps this worker's
-        // other tasks between polls (matching tokio's block_in_place semantics).
-        // Progress made by those tasks can produce the value we're blocked on.
         if let Some(exec) = crate::executor::try_current_executor() {
             return exec.block_on(f);
         }
 
-        // Threaded mode on a JS thread (should only be the Acceptor; the main
-        // thread cannot block): Condvar wait with periodic timeout.
-        // The timeout ensures we re-poll even if a waker notification was missed
-        // (e.g., waker called between poll returning Pending and entering wait).
         let mut f = std::pin::pin!(f);
-        let cv_waker = Arc::new(CondvarWaker {
-            woken: Mutex::new(false),
-            cvar: Condvar::new(),
-        });
-        let waker: std::task::Waker = cv_waker.clone().into();
+        let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
-
-        loop {
-            match f.as_mut().poll(&mut cx) {
-                Poll::Ready(val) => return val,
-                Poll::Pending => {
-                    // Wait for the waker with a timeout. The timeout (5ms) ensures
-                    // we re-poll periodically, which handles cases where:
-                    // - The waker was called before we entered wait
-                    // - Cross-worker wake notifications were delayed
-                    // - The poll nudge on other workers triggered state changes
-                    let mut woken = cv_waker.woken.lock().unwrap();
-                    if !*woken {
-                        let (_guard, _timeout) = cv_waker
-                            .cvar
-                            .wait_timeout(woken, std::time::Duration::from_millis(5))
-                            .unwrap();
-                        woken = _guard;
-                    }
-                    *woken = false;
-                }
-            }
+        match f.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!(
+                "block_in_place: cannot wait on a WASM JS event-loop thread; \
+                 await the future or run it on a compute worker"
+            ),
         }
     }
 }

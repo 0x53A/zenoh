@@ -17,8 +17,9 @@
 use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use wasm_bindgen::{closure::Closure, JsCast, JsValue};
-use web_sys::{BinaryType, ErrorEvent, MessageEvent, WebSocket};
+use web_sys::{BinaryType, MessageEvent, WebSocket};
 use zenoh_link_commons::{
     LinkAuthId, LinkManagerUnicastTrait, LinkUnicast, LinkUnicastTrait, NewLinkChannelSender,
 };
@@ -30,25 +31,9 @@ use zenoh_result::{bail, zerror, ZResult};
 
 use super::{WS_DEFAULT_MTU, WS_LOCATOR_PREFIX};
 
-/// Wrapper to make JsValue-based types Send+Sync on WASM.
-/// SAFETY: With shared-memory workers, the wrapped JS object is thread-affine —
-/// only accessed from the worker that created it. The write_tx channel ensures
-/// write requests are proxied to the correct worker.
-struct SendWrapper<T>(T);
-unsafe impl<T> Send for SendWrapper<T> {}
-unsafe impl<T> Sync for SendWrapper<T> {}
-
-impl<T> std::ops::Deref for SendWrapper<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.0
-    }
-}
-
-/// Write request sent through the channel to the WebSocket-owning worker.
+/// Writes are acknowledged by the JS owner, preserving transport backpressure.
 enum WriteCmd {
-    Send(Vec<u8>),
-    Close,
+    Send(Vec<u8>, flume::Sender<Result<(), String>>),
 }
 
 pub struct LinkUnicastWs {
@@ -62,107 +47,151 @@ pub struct LinkUnicastWs {
     _io_close_tx: flume::Sender<()>,
 }
 
-/// Result of synchronously setting up a WebSocket connection.
-/// All !Send types are already wrapped in SendWrapper.
-/// Closures are stored and returned so they can be dropped when the link closes.
-struct WsSetup {
-    write_tx: flume::Sender<WriteCmd>,
-    recv_rx: flume::Receiver<Vec<u8>>,
-    open_rx: flume::Receiver<Result<(), String>>,
-    msg_closures: SendWrapper<Vec<Closure<dyn FnMut(MessageEvent)>>>,
-    err_closures: SendWrapper<Vec<Closure<dyn FnMut(ErrorEvent)>>>,
+/// This guard and all JS objects stay on the owning spawn_local task.
+/// Detach callbacks before freeing them, including on failed/cancelled opens.
+struct SocketOwner {
+    ws: WebSocket,
+    _message: Closure<dyn FnMut(MessageEvent)>,
+    _open: Closure<dyn FnMut(JsValue)>,
+    _error: Closure<dyn FnMut(JsValue)>,
+    _close: Closure<dyn FnMut(JsValue)>,
 }
 
-/// Create and configure WebSocket synchronously (no .await).
-/// Returns only Send-safe types. JS closures are stored in the setup for later cleanup.
-fn setup_ws(url: &str) -> ZResult<WsSetup> {
-    let ws = WebSocket::new(url)
-        .map_err(|e| zerror!("Failed to create WebSocket to {}: {:?}", url, e))?;
+impl Drop for SocketOwner {
+    fn drop(&mut self) {
+        self.ws.set_onmessage(None);
+        self.ws.set_onopen(None);
+        self.ws.set_onerror(None);
+        self.ws.set_onclose(None);
+        let _ = self.ws.close();
+    }
+}
+
+type Connected = (flume::Sender<WriteCmd>, flume::Receiver<Vec<u8>>);
+
+async fn run_socket(
+    url: String,
+    result_tx: flume::Sender<Result<Connected, String>>,
+    close_rx: flume::Receiver<()>,
+) {
+    let ws = match WebSocket::new(&url) {
+        Ok(ws) => ws,
+        Err(e) => {
+            let _ = result_tx.send(Err(format!("WebSocket creation failed: {e:?}")));
+            return;
+        }
+    };
     ws.set_binary_type(BinaryType::Arraybuffer);
-
-    let (recv_tx, recv_rx) = flume::unbounded::<Vec<u8>>();
-    let (open_tx, open_rx) = flume::bounded::<Result<(), String>>(1);
-
-    let msg_tx = recv_tx.clone();
+    // Browsers do not expose receive-side WebSocket backpressure. Bound the
+    // copied Rust backlog; an overloaded link must fail rather than grow forever.
+    let (recv_tx, recv_rx) = flume::bounded(128);
+    let (event_tx, event_rx) = flume::unbounded::<Result<(), String>>();
+    let message_error_tx = event_tx.clone();
     let on_message = Closure::wrap(Box::new(move |e: MessageEvent| {
         if let Ok(abuf) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
-            let array = js_sys::Uint8Array::new(&abuf);
-            let _ = msg_tx.send(array.to_vec());
+            if abuf.byte_length() == 0 {
+                return;
+            }
+            if abuf.byte_length() > super::WS_MAX_MTU as u32 {
+                let _ = message_error_tx.send(Err("WebSocket frame exceeds link MTU".into()));
+                return;
+            }
+            match recv_tx.try_send(js_sys::Uint8Array::new(&abuf).to_vec()) {
+                Ok(()) => {},
+                Err(flume::TrySendError::Full(_)) => {
+                    let _ = message_error_tx.send(Err("WebSocket receive backlog exceeded".into()));
+                },
+                Err(flume::TrySendError::Disconnected(_)) => {
+                    let _ = message_error_tx.send(Err("WebSocket receive stream closed".into()));
+                },
+            }
+        } else {
+            // Zenoh WebSocket links carry binary batches. Match the native
+            // transport's rejection instead of leaving readers waiting forever.
+            let _ = message_error_tx.send(Err("WebSocket received a non-binary frame".into()));
         }
     }) as Box<dyn FnMut(MessageEvent)>);
+    let tx = event_tx.clone();
+    let on_open = Closure::wrap(Box::new(move |_: JsValue| {
+        let _ = tx.send(Ok(()));
+    }) as Box<dyn FnMut(JsValue)>);
+    let tx = event_tx.clone();
+    // Browser WebSocket errors are Event, not ErrorEvent.
+    let on_error = Closure::wrap(Box::new(move |_: JsValue| {
+        let _ = tx.send(Err("WebSocket error".into()));
+    }) as Box<dyn FnMut(JsValue)>);
+    let on_close = Closure::wrap(Box::new(move |_: JsValue| {
+        let _ = event_tx.send(Err("WebSocket closed".into()));
+    }) as Box<dyn FnMut(JsValue)>);
     ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-
-    let err_tx = open_tx.clone();
-    let on_error = Closure::wrap(Box::new(move |e: ErrorEvent| {
-        let msg = format!("WebSocket error: {}", e.message());
-        tracing::error!("{}", msg);
-        let _ = err_tx.send(Err(msg));
-    }) as Box<dyn FnMut(ErrorEvent)>);
-    ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
-
-    // Drop recv_tx on close so that read() returns an error promptly,
-    // which triggers the transport layer's reconnection logic.
-    let on_close = Closure::once(move |_: JsValue| {
-        drop(recv_tx);
-        tracing::warn!("WebSocket connection closed by remote");
-    });
-    ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
-    on_close.forget(); // one-shot, cleaned up when WS is GC'd
-
-    let on_open = Closure::once(move |_: JsValue| {
-        let _ = open_tx.send(Ok(()));
-    });
     ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
-    // on_open is a one-shot — forget it since it's cleared after connection opens
-    on_open.forget();
-
-    // Channel-based write path: write requests are sent through write_tx and
-    // dequeued by a spawn_local loop on this worker (which owns the WebSocket).
-    // This ensures ws.send() is always called from the creating worker's JS context,
-    // which is required for thread safety with SharedArrayBuffer workers.
-    let (write_tx, write_rx) = flume::unbounded::<WriteCmd>();
-    let ws_for_write = SendWrapper(ws.clone());
-    wasm_bindgen_futures::spawn_local(async move {
-        // Senders are on compute workers — recv_async_anywhere self-repolls
-        // via setTimeout on this (Acceptor) thread instead of relying on
-        // cross-thread microtask wakes.
-        while let Ok(cmd) = zenoh_runtime::recv_async_anywhere(&write_rx).await {
-            match cmd {
-                WriteCmd::Send(data) => {
-                    // With +atomics the WASM linear memory is a SharedArrayBuffer,
-                    // and WebSocket.send() rejects SAB-backed views with a TypeError.
-                    // Copy into a fresh (non-shared) buffer before sending.
-                    let array = js_sys::Uint8Array::new_with_length(data.len() as u32);
-                    array.copy_from(&data);
-                    if let Err(e) = ws_for_write.send_with_array_buffer(&array.buffer()) {
-                        tracing::error!("WebSocket send failed: {:?}", e);
-                    }
-                }
-                WriteCmd::Close => {
-                    ws_for_write.set_onmessage(None);
-                    ws_for_write.set_onerror(None);
-                    ws_for_write.set_onclose(None);
-                    let _ = ws_for_write.close();
-                    break;
-                }
+    ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+    ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+    let owner = SocketOwner {
+        ws,
+        _message: on_message,
+        _open: on_open,
+        _error: on_error,
+        _close: on_close,
+    };
+    let opened = futures::select_biased! {
+        _ = zenoh_runtime::recv_async_anywhere(&close_rx).fuse() => return,
+        event = event_rx.recv_async().fuse() => event,
+    };
+    match opened {
+        Ok(Ok(())) => {}
+        event => {
+            let _ = result_tx.send(Err(format!("WebSocket failed to open: {event:?}")));
+            return;
+        }
+    }
+    let (write_tx, write_rx) = flume::unbounded();
+    if result_tx.send(Ok((write_tx, recv_rx))).is_err() {
+        return;
+    }
+    loop {
+        let cmd = futures::select_biased! {
+            _ = zenoh_runtime::recv_async_anywhere(&close_rx).fuse() => break,
+            event = event_rx.recv_async().fuse() => {
+                tracing::debug!("WebSocket owner stopped: {event:?}");
+                break;
+            },
+            cmd = zenoh_runtime::recv_async_anywhere(&write_rx).fuse() => cmd,
+        };
+        let Ok(WriteCmd::Send(data, ack)) = cmd else {
+            break;
+        };
+        // Bound the browser send backlog, remaining responsive to shutdown.
+        while owner.ws.buffered_amount() > 1024 * 1024 {
+            futures::select_biased! {
+                _ = zenoh_runtime::recv_async_anywhere(&close_rx).fuse() => return,
+                _ = event_rx.recv_async().fuse() => return,
+                _ = zenoh_runtime::wasm_yield::sleep_ms(4).fuse() => {},
             }
         }
-    });
-
-    Ok(WsSetup {
-        write_tx,
-        recv_rx,
-        open_rx,
-        msg_closures: SendWrapper(vec![on_message]),
-        err_closures: SendWrapper(vec![on_error]),
-    })
+        if owner.ws.ready_state() != WebSocket::OPEN {
+            let _ = ack.send(Err("WebSocket is not open".into()));
+            break;
+        }
+        // WebSocket.send rejects SharedArrayBuffer-backed views.
+        let array = js_sys::Uint8Array::new_with_length(data.len() as u32);
+        array.copy_from(&data);
+        let result = owner
+            .ws
+            .send_with_array_buffer(&array.buffer())
+            .map_err(|e| format!("WebSocket send failed: {e:?}"));
+        let failed = result.is_err();
+        let _ = ack.send(result);
+        if failed {
+            break;
+        }
+    }
 }
 
 impl LinkUnicastWs {
-    async fn new(url: &str) -> ZResult<Self> {
+    async fn new(url: &str, dst_locator: Locator) -> ZResult<Self> {
         let url_owned = url.to_string();
         let src_locator = Locator::new(WS_LOCATOR_PREFIX, "wasm-client", "").unwrap();
-        let dst_locator = Locator::new(WS_LOCATOR_PREFIX, url, "").unwrap();
 
         // Dispatch WebSocket creation to the Acceptor worker (dedicated I/O worker).
         // This ensures all JS WebSocket objects and their callbacks live on a worker
@@ -177,36 +206,7 @@ impl LinkUnicastWs {
         let (close_tx, close_rx) = flume::bounded::<()>(1);
 
         zenoh_runtime::ZRuntime::Acceptor.spawn(async move {
-            let setup = match setup_ws(&url_owned) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = result_tx.send(Err(format!("WebSocket setup failed: {e}")));
-                    return;
-                }
-            };
-
-            // Wait for connection to open (on the Acceptor worker's event loop)
-            match zenoh_runtime::recv_async_anywhere(&setup.open_rx).await {
-                Ok(Ok(())) => {
-                    let _ = result_tx.send(Ok((setup.write_tx, setup.recv_rx)));
-                }
-                Ok(Err(e)) => {
-                    let _ = result_tx.send(Err(format!("WebSocket connection failed: {e}")));
-                    return;
-                }
-                Err(_) => {
-                    let _ =
-                        result_tx.send(Err("WebSocket open channel closed unexpectedly".into()));
-                    return;
-                }
-            }
-
-            // Keep closures alive until the link is closed.
-            // The close_rx channel blocks this task until close_tx is dropped.
-            let _closures = setup.msg_closures;
-            let _err_closures = setup.err_closures;
-            // close_tx is dropped from another worker — needs the repoll-based recv.
-            let _ = zenoh_runtime::recv_async_anywhere(&close_rx).await;
+            wasm_bindgen_futures::spawn_local(run_socket(url_owned, result_tx, close_rx));
         });
 
         // Wait for the Acceptor worker to establish the connection.
@@ -232,18 +232,26 @@ impl LinkUnicastWs {
 impl LinkUnicastTrait for LinkUnicastWs {
     async fn close(&self) -> ZResult<()> {
         tracing::trace!("Closing WebSocket link: {}", self);
-        // Send close command through the write channel — the write loop on the
-        // owning worker will clear handlers and close the WebSocket.
-        let _ = self.write_tx.send(WriteCmd::Close);
+        // Wake the owner even if writes are blocked behind browser backpressure.
+        let _ = self._io_close_tx.try_send(());
         Ok(())
     }
 
     async fn write(&self, buffer: &[u8], _priority: Option<Priority>) -> ZResult<usize> {
         // Send through the channel — the write loop on the WebSocket-owning
         // worker will call ws.send_with_u8_array() from the correct JS context.
+        let started = zenoh_runtime::wasm_yield::Instant::now();
+        let (ack_tx, ack_rx) = flume::bounded(1);
         self.write_tx
-            .send(WriteCmd::Send(buffer.to_vec()))
+            .send(WriteCmd::Send(buffer.to_vec(), ack_tx))
             .map_err(|e| zerror!("Write error on WebSocket link {}: {}", self, e))?;
+        zenoh_runtime::recv_async_anywhere(&ack_rx)
+            .await
+            .map_err(|e| zerror!("WebSocket writer stopped: {e}"))?
+            .map_err(|e| zerror!("{e}"))?;
+        if started.elapsed() > std::time::Duration::from_millis(250) {
+            tracing::warn!("WebSocket write acknowledgement delayed {:?} on {}", started.elapsed(), self);
+        }
         Ok(buffer.len())
     }
 
@@ -371,7 +379,7 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastWs {
         };
         let url = format!("{}://{}", scheme, address);
         tracing::debug!("Opening WASM WebSocket connection to {}", url);
-        let link = Arc::new(LinkUnicastWs::new(&url).await?);
+        let link = Arc::new(LinkUnicastWs::new(&url, endpoint.to_locator()).await?);
         Ok(LinkUnicast(zenoh_link_commons::NewLink::Single(link)))
     }
 

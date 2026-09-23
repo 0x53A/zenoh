@@ -13,24 +13,15 @@
 //! - Built-in timer queue for `sleep_ms` / timeout futures
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::task::{Context, Poll, Wake};
 use std::time::Duration;
 
-use wasm_bindgen::prelude::*;
-
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = Date, js_name = "now")]
-    fn date_now() -> f64;
-}
-
-pub(crate) fn now_ms() -> u64 {
-    date_now() as u64
-}
+pub(crate) use crate::wasm_yield::now_ms;
 
 thread_local! {
     static CURRENT_EXECUTOR: RefCell<Option<Rc<LocalExecutor>>> = const { RefCell::new(None) };
@@ -53,13 +44,34 @@ struct WakeState {
     inner: Mutex<WakeInner>,
 }
 
+impl WakeState {
+    fn lock(&self) -> MutexGuard<'_, WakeInner> {
+        if has_local_executor() {
+            return self.inner.lock().unwrap();
+        }
+        // JS callbacks can wake compute tasks or drop migrated timers. A
+        // contended std mutex would execute Atomics.wait on the browser main
+        // thread, where it throws. These critical sections never await or poll
+        // user futures; use non-sleeping acquisition on event-loop threads.
+        loop {
+            match self.inner.try_lock() {
+                Ok(guard) => return guard,
+                Err(TryLockError::WouldBlock) => std::hint::spin_loop(),
+                Err(TryLockError::Poisoned(_)) => panic!("executor wake state poisoned"),
+            }
+        }
+    }
+}
+
 struct WakeInner {
     /// Task IDs that have been woken and need re-polling.
-    task_queue: Vec<usize>,
+    task_queue: VecDeque<usize>,
+    queued: HashSet<usize>,
     /// Set by `BlockOnWaker` to signal the `block_on` caller.
     block_woken: bool,
     /// Pending timers: (deadline_ms, waker). Fired when `now_ms() >= deadline_ms`.
-    timers: Vec<TimerEntry>,
+    timers: HashMap<usize, TimerEntry>,
+    next_timer: usize,
 }
 
 struct TimerEntry {
@@ -68,11 +80,12 @@ struct TimerEntry {
 }
 
 pub(crate) struct LocalExecutor {
-    /// Task storage. `Some(future)` = live task, `None` = completed/empty slot.
-    tasks: RefCell<Vec<Option<Pin<Box<dyn Future<Output = ()>>>>>>,
+    /// Live tasks; completed futures are removed instead of retaining empty slots.
+    tasks: RefCell<HashMap<usize, Pin<Box<dyn Future<Output = ()>>>>>,
     /// Newly spawned futures, drained into `tasks` at the start of each pump cycle.
     /// Separate from `tasks` to avoid RefCell conflicts when a polled task spawns.
     spawn_queue: RefCell<Vec<Pin<Box<dyn Future<Output = ()>>>>>,
+    active: RefCell<HashSet<usize>>,
     /// Cross-thread wake notifications.
     wake_state: Arc<WakeState>,
     /// Monotonically increasing task ID counter.
@@ -82,14 +95,17 @@ pub(crate) struct LocalExecutor {
 impl LocalExecutor {
     pub fn new() -> Self {
         LocalExecutor {
-            tasks: RefCell::new(Vec::new()),
+            tasks: RefCell::new(HashMap::new()),
             spawn_queue: RefCell::new(Vec::new()),
+            active: RefCell::new(HashSet::new()),
             wake_state: Arc::new(WakeState {
                 condvar: Condvar::new(),
                 inner: Mutex::new(WakeInner {
-                    task_queue: Vec::new(),
+                    task_queue: VecDeque::new(),
+                    queued: HashSet::new(),
                     block_woken: false,
-                    timers: Vec::new(),
+                    timers: HashMap::new(),
+                    next_timer: 0,
                 }),
             }),
             next_id: Cell::new(0),
@@ -113,12 +129,14 @@ impl LocalExecutor {
 
     /// Register a timer. When `now_ms() >= deadline_ms`, the waker will be called.
     /// Used by `CondvarSleep` futures for pure-Rust sleep on compute workers.
-    pub fn register_timer(&self, deadline_ms: u64, waker: std::task::Waker) {
-        let mut inner = self.wake_state.inner.lock().unwrap();
-        inner.timers.push(TimerEntry { deadline_ms, waker });
-        // If the timer is already expired, notify immediately
-        if now_ms() >= deadline_ms {
-            self.wake_state.condvar.notify_one();
+    pub fn register_timer(&self, deadline_ms: u64, waker: std::task::Waker) -> TimerRegistration {
+        let mut inner = self.wake_state.lock();
+        let id = inner.next_timer;
+        inner.next_timer += 1;
+        inner.timers.insert(id, TimerEntry { deadline_ms, waker });
+        TimerRegistration {
+            id,
+            state: self.wake_state.clone(),
         }
     }
 
@@ -126,10 +144,10 @@ impl LocalExecutor {
     /// after releasing the lock to avoid deadlock (wakers re-acquire the lock).
     fn fire_expired_timers(&self) {
         let expired: Vec<std::task::Waker> = {
-            let mut inner = self.wake_state.inner.lock().unwrap();
+            let mut inner = self.wake_state.lock();
             let now = now_ms();
             let mut expired = Vec::new();
-            inner.timers.retain(|t| {
+            inner.timers.retain(|_, t| {
                 if t.deadline_ms <= now {
                     expired.push(t.waker.clone());
                     false
@@ -149,7 +167,7 @@ impl LocalExecutor {
         let now = now_ms();
         inner
             .timers
-            .iter()
+            .values()
             .map(|t| Duration::from_millis(t.deadline_ms.saturating_sub(now)))
             .min()
             .map(|d| d.min(max))
@@ -162,56 +180,51 @@ impl LocalExecutor {
     /// Each task is taken out of its slot before polling (releasing the RefCell
     /// borrow) so that polled tasks can call `spawn()` without conflict.
     fn pump(&self) {
-        loop {
-            // Phase 1: move spawned futures into the task list and mark them ready
+        // Bound each turn: a task that repeatedly yields must not starve timers
+        // or the future being driven by block_on. Pop one ID at a time so a
+        // nested block_on can still access all other ready tasks.
+        for _ in 0..64 {
             {
                 let mut sq = self.spawn_queue.borrow_mut();
-                if !sq.is_empty() {
-                    let mut tasks = self.tasks.borrow_mut();
-                    let mut inner = self.wake_state.inner.lock().unwrap();
-                    for fut in sq.drain(..) {
-                        let id = self.next_id.get();
-                        self.next_id.set(id + 1);
-                        if id >= tasks.len() {
-                            tasks.resize_with(id + 1, || None);
-                        }
-                        tasks[id] = Some(fut);
-                        inner.task_queue.push(id);
-                    }
+                let mut tasks = self.tasks.borrow_mut();
+                let mut inner = self.wake_state.lock();
+                for fut in sq.drain(..) {
+                    let id = self.next_id.get();
+                    self.next_id
+                        .set(id.checked_add(1).expect("task ID overflow"));
+                    tasks.insert(id, fut);
+                    inner.queued.insert(id);
+                    inner.task_queue.push_back(id);
                 }
             }
-
-            // Phase 2: take woken IDs
-            let woken: Vec<usize> = {
-                let mut inner = self.wake_state.inner.lock().unwrap();
-                if inner.task_queue.is_empty() {
+            let id = {
+                let mut inner = self.wake_state.lock();
+                let Some(id) = inner.task_queue.pop_front() else {
                     return;
-                }
-                std::mem::take(&mut inner.task_queue)
+                };
+                inner.queued.remove(&id);
+                id
             };
-
-            // Phase 3: poll each woken task
-            for id in woken {
-                // Take future out — releases borrow so poll can call spawn()
-                let fut = self.tasks.borrow_mut().get_mut(id).and_then(|s| s.take());
-
-                if let Some(mut fut) = fut {
-                    let waker: std::task::Waker = Arc::new(TaskWaker {
-                        task_id: id,
-                        wake_state: self.wake_state.clone(),
-                    })
-                    .into();
-                    let mut cx = Context::from_waker(&waker);
-
-                    match fut.as_mut().poll(&mut cx) {
-                        Poll::Ready(()) => {
-                            // Done — slot stays None (could reclaim later)
-                        }
-                        Poll::Pending => {
-                            // Put it back; waker will re-enqueue when ready
-                            self.tasks.borrow_mut()[id] = Some(fut);
-                        }
-                    }
+            let fut = self.tasks.borrow_mut().remove(&id);
+            if let Some(mut fut) = fut {
+                self.active.borrow_mut().insert(id);
+                let waker = Arc::new(TaskWaker {
+                    task_id: id,
+                    wake_state: self.wake_state.clone(),
+                })
+                .into();
+                let mut cx = Context::from_waker(&waker);
+                let pending = fut.as_mut().poll(&mut cx).is_pending();
+                self.active.borrow_mut().remove(&id);
+                if pending {
+                    self.tasks.borrow_mut().insert(id, fut);
+                }
+            } else if self.active.borrow().contains(&id) {
+                // A nested block_on cannot poll its suspended caller, but it
+                // must preserve that caller's wake for when the poll returns.
+                let mut inner = self.wake_state.lock();
+                if inner.queued.insert(id) {
+                    inner.task_queue.push_back(id);
                 }
             }
         }
@@ -227,7 +240,7 @@ impl LocalExecutor {
 
         loop {
             // Clear flag before poll so we detect wakes during/after poll
-            self.wake_state.inner.lock().unwrap().block_woken = false;
+            self.wake_state.lock().block_woken = false;
 
             match f.as_mut().poll(&mut cx) {
                 Poll::Ready(v) => return v,
@@ -239,11 +252,15 @@ impl LocalExecutor {
                     self.fire_expired_timers();
 
                     // Check if anything needs attention before sleeping
-                    let inner = self.wake_state.inner.lock().unwrap();
-                    if inner.task_queue.is_empty()
-                        && !inner.block_woken
-                        && self.spawn_queue.borrow().is_empty()
-                    {
+                    let inner = self.wake_state.lock();
+                    // Wakes for callers suspended inside a nested block_on
+                    // must stay queued, but cannot make progress until their
+                    // current poll returns. Do not busy-spin on those IDs.
+                    let has_runnable = {
+                        let active = self.active.borrow();
+                        inner.task_queue.iter().any(|id| !active.contains(id))
+                    };
+                    if !has_runnable && !inner.block_woken && self.spawn_queue.borrow().is_empty() {
                         // Sleep until woken, timer fires, or timeout
                         let timeout = self.time_until_next_timer(&inner, Duration::from_millis(1));
                         let _ = self.wake_state.condvar.wait_timeout(inner, timeout);
@@ -262,7 +279,7 @@ impl LocalExecutor {
             // Fire expired timers
             self.fire_expired_timers();
 
-            let inner = self.wake_state.inner.lock().unwrap();
+            let inner = self.wake_state.lock();
             if inner.task_queue.is_empty() && self.spawn_queue.borrow().is_empty() {
                 let timeout = self.time_until_next_timer(&inner, Duration::from_millis(100));
                 let _ = self.wake_state.condvar.wait_timeout(inner, timeout);
@@ -280,8 +297,10 @@ struct TaskWaker {
 
 impl Wake for TaskWaker {
     fn wake(self: Arc<Self>) {
-        let mut inner = self.wake_state.inner.lock().unwrap();
-        inner.task_queue.push(self.task_id);
+        let mut inner = self.wake_state.lock();
+        if inner.queued.insert(self.task_id) {
+            inner.task_queue.push_back(self.task_id);
+        }
         drop(inner);
         self.wake_state.condvar.notify_one();
     }
@@ -292,9 +311,36 @@ struct BlockOnWaker(Arc<WakeState>);
 
 impl Wake for BlockOnWaker {
     fn wake(self: Arc<Self>) {
-        let mut inner = self.0.inner.lock().unwrap();
+        let mut inner = self.0.lock();
         inner.block_woken = true;
         drop(inner);
         self.0.condvar.notify_one();
+    }
+}
+
+/// Removes a sleep's timer when the future completes or is cancelled.
+pub(crate) struct TimerRegistration {
+    id: usize,
+    state: Arc<WakeState>,
+}
+
+impl TimerRegistration {
+    pub fn update_waker(&self, executor: &LocalExecutor, waker: &std::task::Waker) -> bool {
+        // Migrated sleeps must not depend on the old worker making progress.
+        if !Arc::ptr_eq(&self.state, &executor.wake_state) {
+            return false;
+        }
+        if let Some(timer) = self.state.lock().timers.get_mut(&self.id) {
+            timer.waker.clone_from(waker);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for TimerRegistration {
+    fn drop(&mut self) {
+        self.state.lock().timers.remove(&self.id);
     }
 }
