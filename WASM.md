@@ -1,7 +1,6 @@
 # Browser WASM branch
 
-This branch runs the Rust Zenoh client in browsers over WS/WSS. It is a working
-port and a source of reusable changes, not a proposal to merge the entire branch.
+This branch runs the Rust Zenoh client in browsers over WS/WSS.
 The native implementation remains available. Upstream main was merged through
 `9fcd9cb5d364192c3e8a27e66de76f4bc750d1d5` (Zenoh 1.10.1).
 
@@ -14,7 +13,7 @@ The subsequent [iterative review](https://github.com/0x53A/hiroz-web/blob/main/d
 covers timer ownership, remaining browser deadlines, native task shutdown and
 the final pass that found no new actionable issues.
 
-## Where to look
+## Implementation
 
 - `commons/zenoh-runtime`: native/runtime separation, single-thread browser
   execution, shared-memory worker execution, cancellation, monotonic timers and
@@ -53,5 +52,4 @@ not remote application receipt. Background tabs can be throttled or suspended.
 
 Native builds still use Tokio. Browser timeouts use the monotonic runtime timer;
 connection, acceptance and flush deadlines are not intentionally disabled.
-The old fixed WS accept-loop report is archived in the integration repository,
-outside this library's upstream diff.
+The old fixed WS accept-loop report is archived in the integration repository.
