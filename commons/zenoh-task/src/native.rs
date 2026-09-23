@@ -140,6 +140,13 @@ impl std::fmt::Debug for TerminatableTask {
 
 impl Drop for TerminatableTask {
     fn drop(&mut self) {
+        // The final owner can be released by the task itself (for example a
+        // routing worker dropping its last tables reference). It cannot join
+        // itself; let the current poll unwind normally after cancellation.
+        if self.handle.as_ref().is_some_and(|handle| Some(handle.id()) == tokio::task::try_id()) {
+            self.token.cancel();
+            return;
+        }
         self.terminate(std::time::Duration::from_secs(10));
     }
 }
@@ -196,8 +203,47 @@ impl TerminatableTask {
 
     pub async fn terminate_async(&mut self) {
         self.token.cancel();
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = self.handle.as_mut() {
             let _ = handle.await;
         }
+        // Preserve ownership if this wait is canceled or times out.
+        self.handle = None;
+    }
+}
+
+#[cfg(test)]
+mod termination_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_termination_keeps_the_join_handle() {
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let mut task = TerminatableTask::spawn(
+            ZRuntime::Application,
+            async move { let _ = released.await; },
+            CancellationToken::new(),
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(10), task.terminate_async()).await.is_err());
+        let retained = task.handle.is_some();
+        release.send(()).unwrap();
+        task.terminate_async().await;
+        assert!(retained, "a canceled wait must not detach the task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_its_own_handle_does_not_wait_for_itself() {
+        let (send_handle, receive_handle) = tokio::sync::oneshot::channel::<TerminatableTask>();
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let task = TerminatableTask::spawn(
+            ZRuntime::Application,
+            async move {
+                drop(receive_handle.await.unwrap());
+                let _ = done.send(());
+            },
+            CancellationToken::new(),
+        );
+        send_handle.send(task).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), finished).await
+            .expect("dropping the current task's owner must not self-join").unwrap();
     }
 }

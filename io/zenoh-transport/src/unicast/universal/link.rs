@@ -35,6 +35,10 @@ use std::{
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::task::JoinHandle;
+#[cfg(target_arch = "wasm32")]
+use zenoh_runtime::JoinHandle;
 #[cfg(target_arch = "wasm32")]
 use zenoh_runtime::wasm_yield::Instant;
 
@@ -543,15 +547,13 @@ struct TimeoutTrackerInner {
     waker: AtomicWaker,
     has_timed_out: AtomicBool,
     latest_reset: Mutex<Instant>,
-    #[cfg(not(target_arch = "wasm32"))]
-    task: OnceLock<tokio::task::JoinHandle<()>>,
+    task: OnceLock<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
 struct TimeoutTracker(Arc<TimeoutTrackerInner>);
 
 impl TimeoutTracker {
-    #[cfg(not(target_arch = "wasm32"))]
     fn new(timeout: Duration) -> TimeoutTracker {
         let now = Instant::now();
         let inner = Arc::new(TimeoutTrackerInner {
@@ -562,56 +564,30 @@ impl TimeoutTracker {
             task: OnceLock::new(),
         });
         let tracker = Arc::downgrade(&inner);
-        let task = tokio::spawn(async move {
+        let future = async move {
             let mut latest_reset = now;
             loop {
-                tokio::time::sleep_until((latest_reset + timeout).into()).await;
-                let prev = latest_reset;
+                // Preserve the deadline after a reset instead of sleeping a
+                // second full interval. Subtraction also handles huge durations.
+                // Even an already-expired deadline must yield before repeating.
+                let remaining = timeout.saturating_sub(latest_reset.elapsed());
+                zenoh_runtime::compat::sleep(remaining.max(Duration::from_nanos(1))).await;
                 let Some(tracker) = tracker.upgrade() else {
                     break;
                 };
                 latest_reset = *tracker.latest_reset.lock().unwrap();
-                if latest_reset <= prev {
+                if latest_reset.elapsed() >= timeout {
                     latest_reset = Instant::now();
                     tracker.has_timed_out.store(true, Ordering::Release);
                     tracker.waker.wake();
                 }
             }
-        });
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let task = tokio::spawn(future);
+        #[cfg(target_arch = "wasm32")]
+        let task = zenoh_runtime::ZRuntime::RX.spawn(future);
         inner.task.set(task).unwrap();
-        Self(inner)
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn new(timeout: Duration) -> TimeoutTracker {
-        let now = Instant::now();
-        let inner = Arc::new(TimeoutTrackerInner {
-            timeout,
-            waker: AtomicWaker::new(),
-            has_timed_out: AtomicBool::new(false),
-            latest_reset: Mutex::new(now),
-        });
-        // On WASM, use an async sleep_ms loop for timeout tracking. spawn_on_current
-        // targets the LocalExecutor on compute workers (where setTimeout/spawn_local
-        // would never fire) and the JS microtask queue elsewhere.
-        let tracker = Arc::downgrade(&inner);
-        let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
-        zenoh_runtime::spawn_on_current(async move {
-            let mut latest_reset = now;
-            loop {
-                zenoh_runtime::wasm_yield::sleep_ms(timeout_ms).await;
-                let prev = latest_reset;
-                let Some(tracker) = tracker.upgrade() else {
-                    break;
-                };
-                latest_reset = *tracker.latest_reset.lock().unwrap();
-                if latest_reset <= prev {
-                    latest_reset = Instant::now();
-                    tracker.has_timed_out.store(true, Ordering::Release);
-                    tracker.waker.wake();
-                }
-            }
-        });
         Self(inner)
     }
 
@@ -639,10 +615,48 @@ impl TimeoutTracker {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-impl Drop for TimeoutTracker {
+impl Drop for TimeoutTrackerInner {
     fn drop(&mut self) {
-        self.0.task.get().unwrap().abort();
+        // Clones share the timer: only its final owner may stop it. Abort also
+        // releases browser timer registrations when a link closes before expiry.
+        if let Some(task) = self.task.get() {
+            task.abort();
+        }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod timeout_tracker_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropping_a_clone_keeps_timeout_active() {
+        let tracker = TimeoutTracker::new(Duration::from_millis(20));
+        drop(tracker.clone());
+        tokio::time::timeout(Duration::from_secs(1), tracker.wait_if(true))
+            .await.expect("another owner still needs the timer");
+    }
+
+    #[tokio::test]
+    async fn final_owner_aborts_pending_timer() {
+        let tracker = TimeoutTracker::new(Duration::from_secs(3600));
+        let task = tracker.0.task.get().unwrap().abort_handle();
+        tokio::task::yield_now().await;
+        drop(tracker);
+        tokio::task::yield_now().await;
+        assert!(task.is_finished(), "closed links must release their timer tasks");
+    }
+
+    #[tokio::test]
+    async fn reset_postpones_timeout_until_a_full_idle_interval() {
+        let interval = Duration::from_millis(80);
+        let tracker = TimeoutTracker::new(interval);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        tracker.reset();
+        let reset = Instant::now();
+        tokio::time::timeout(Duration::from_secs(1), tracker.wait_if(true))
+            .await.expect("an idle tracker must eventually expire");
+        assert!(reset.elapsed() >= interval);
     }
 }
 
