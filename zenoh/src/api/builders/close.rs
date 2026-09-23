@@ -128,19 +128,11 @@ impl<TCloseable: Closeable> IntoFuture for CloseBuilder<TCloseable> {
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(
             async move {
-                #[cfg(not(target_arch = "wasm32"))]
+                if zenoh_runtime::compat::timeout(self.timeout, self.closee.close_inner(self.close_args))
+                    .await
+                    .is_err()
                 {
-                    if tokio::time::timeout(self.timeout, self.closee.close_inner(self.close_args))
-                        .await
-                        .is_err()
-                    {
-                        bail!("close operation timed out!")
-                    }
-                }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    // On WASM, tokio::time is not available; just run without timeout
-                    self.closee.close_inner(self.close_args).await;
+                    bail!("close operation timed out!")
                 }
                 Ok(())
             }
@@ -272,5 +264,30 @@ impl CloseBuilder<crate::Session> {
     pub fn wait_callbacks(mut self) -> Self {
         self.close_args.wait_callbacks = true;
         self
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod close_builder_tests {
+    use super::*;
+
+    struct PendingClose;
+    impl Closeable for PendingClose {
+        type TClosee = Self;
+        fn get_closee(&self) -> Self { Self }
+    }
+    #[async_trait]
+    impl Closee for PendingClose {
+        type CloseArgs = ();
+        async fn close_inner(&self, _: ()) { std::future::pending::<()>().await; }
+    }
+
+    #[tokio::test]
+    async fn pending_close_respects_its_deadline() {
+        let mut close = CloseBuilder::new(&PendingClose);
+        close.timeout = Duration::from_millis(10);
+        let result = tokio::time::timeout(Duration::from_secs(1), close.into_future())
+            .await.expect("close must apply its own deadline");
+        assert!(result.unwrap_err().to_string().contains("close operation timed out"));
     }
 }

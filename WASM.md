@@ -10,6 +10,9 @@ threaded browser harness, ROS 2 fixtures, demos and CI. Clone it recursively to
 get matching Zenoh, hiroz and example revisions. See its
 [validation notes](https://github.com/0x53A/hiroz-web/blob/main/docs/reviews/2026-09-23-upstream-cleanup.md)
 for the checks actually run after this merge.
+The subsequent [iterative review](https://github.com/0x53A/hiroz-web/blob/main/docs/reviews/2026-09-23-iterative-review.md)
+covers timer ownership, remaining browser deadlines, native task shutdown and
+the final pass that found no new actionable issues.
 
 ## Where to look
 

@@ -852,21 +852,11 @@ async fn sleep_until_instant(instant: Instant) {
     tokio::time::sleep_until(instant.into()).await;
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-async fn sleep_duration(duration: Duration) {
-    tokio::time::sleep(duration).await;
-}
+use zenoh_runtime::compat::sleep as sleep_duration;
 
 #[cfg(target_arch = "wasm32")]
 async fn sleep_until_instant(instant: Instant) {
-    let duration = instant.duration_since(Instant::now());
-    sleep_duration(duration).await;
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn sleep_duration(duration: Duration) {
-    let millis = duration.as_millis().min(u32::MAX as u128) as u32;
-    zenoh_runtime::wasm_yield::sleep_ms(millis).await;
+    sleep_duration(instant.duration_since(Instant::now())).await;
 }
 
 #[zenoh_macros::unstable]

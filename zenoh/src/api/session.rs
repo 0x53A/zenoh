@@ -146,31 +146,7 @@ fn wall_clock_now() -> Duration {
     Duration::from_millis(js_sys::Date::now() as u64)
 }
 
-/// `tokio::time::sleep`, or the browser equivalent on wasm32.
-///
-/// `tokio::time` has no timer driver under `wasm32-unknown-unknown`, so the
-/// query-timeout tasks below cannot use it. `wasm_yield::sleep_ms` goes
-/// through `setTimeout` on JS threads and through the compute workers' own
-/// timer queue under `wasm-threads`; either way the future is `Send`, so it
-/// drops straight into the same `tokio::select!` the native path uses.
-///
-/// Sub-millisecond timeouts round up to 1ms rather than to 0, so a short
-/// timeout still fires late instead of instantly.
-#[cfg(not(target_arch = "wasm32"))]
-fn sleep(duration: Duration) -> impl std::future::Future<Output = ()> + Send {
-    tokio::time::sleep(duration)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn sleep(duration: Duration) -> impl std::future::Future<Output = ()> + Send {
-    let millis = duration.as_millis().min(u128::from(u32::MAX)) as u32;
-    let millis = if millis == 0 && !duration.is_zero() {
-        1
-    } else {
-        millis
-    };
-    zenoh_runtime::wasm_yield::sleep_ms(millis)
-}
+use zenoh_runtime::compat::sleep;
 
 zconfigurable! {
     pub(crate) static ref API_DATA_RECEPTION_CHANNEL_SIZE: usize = 256;

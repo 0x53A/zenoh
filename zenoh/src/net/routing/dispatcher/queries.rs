@@ -17,7 +17,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use itertools::Itertools;
 use zenoh_buffers::ZBuf;
 #[allow(unused_imports)]
@@ -33,8 +32,6 @@ use zenoh_protocol::{
 };
 use zenoh_sync::get_mut_unchecked;
 use zenoh_task::CancellationToken;
-#[cfg(not(target_arch = "wasm32"))]
-use zenoh_util::Timed;
 
 use super::{
     face::FaceState,
@@ -464,13 +461,8 @@ impl QueryCleanup {
             drop(queries_lock);
             face.task_controller
                 .spawn_with_rt(zenoh_runtime::ZRuntime::Net, async move {
-                    #[cfg(not(target_arch = "wasm32"))]
                     tokio::select! {
-                        _ = tokio::time::sleep(timeout) => { cleanup.run().await }
-                        _ = c_cancellation_token.cancelled() => {}
-                    }
-                    #[cfg(target_arch = "wasm32")]
-                    tokio::select! {
+                        _ = zenoh_runtime::compat::sleep(timeout) => { cleanup.run().await }
                         _ = c_cancellation_token.cancelled() => {}
                     }
                 });
@@ -478,9 +470,7 @@ impl QueryCleanup {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[async_trait]
-impl Timed for QueryCleanup {
+impl QueryCleanup {
     async fn run(&mut self) {
         if let Some(mut face) = self.face.upgrade() {
             let ext_respid = Some(response::ext::ResponderIdType {

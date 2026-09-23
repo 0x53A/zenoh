@@ -78,15 +78,10 @@ impl TreesComputationWorker {
         let (tx, rx) = flume::bounded::<Arc<TablesLock>>(1);
         let task = TerminatableTask::spawn_abortable(zenoh_runtime::ZRuntime::Net, async move {
             loop {
-                #[cfg(not(target_arch = "wasm32"))]
-                tokio::time::sleep(std::time::Duration::from_millis(
+                zenoh_runtime::compat::sleep(std::time::Duration::from_millis(
                     *TREES_COMPUTATION_DELAY_MS,
                 ))
                 .await;
-                #[cfg(target_arch = "wasm32")]
-                {
-                    zenoh_runtime::wasm_yield::yield_now().await;
-                }
 
                 if let Ok(tables_ref) = rx.recv_async().await {
                     let mut wtables = zwrite!(tables_ref.tables);

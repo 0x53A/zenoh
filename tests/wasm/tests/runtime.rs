@@ -113,6 +113,13 @@ async fn sleep_respects_monotonic_deadline() {
     assert!(start.elapsed() >= std::time::Duration::from_millis(15));
 }
 
+#[wasm_bindgen_test(async)]
+async fn fractional_millisecond_sleep_rounds_up() {
+    let start = wasm_yield::Instant::now();
+    zenoh_runtime::compat::sleep(std::time::Duration::from_micros(1_500)).await;
+    assert!(start.elapsed() >= std::time::Duration::from_millis(2));
+}
+
 #[wasm_bindgen_test]
 fn block_in_place_accepts_an_immediately_ready_future() {
     assert_eq!(ZRuntime::Application.block_in_place(async { 42 }), 42);

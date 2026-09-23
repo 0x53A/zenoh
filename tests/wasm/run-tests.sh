@@ -4,6 +4,7 @@
 # Usage:
 #   ./run-tests.sh              # run all tests (needs zenohd for session tests)
 #   ./run-tests.sh basic        # run only basic (no-network) tests
+#   ./run-tests.sh runtime      # run runtime and cancellation regressions
 #   ./run-tests.sh session      # run only session (network) tests
 #
 # Prerequisites: geckodriver (or chromedriver), firefox, wasm-pack, cargo
@@ -32,9 +33,14 @@ run_basic() {
     echo "=== Basic tests passed ==="
 }
 
+run_runtime() {
+    echo "=== Running WASM runtime regressions ==="
+    wasm-pack test --headless --firefox -- --test runtime
+}
+
 run_session() {
     echo "=== Building zenohd ==="
-    cargo build --release -p zenohd --manifest-path ../../Cargo.toml
+    cargo build --locked --release -p zenohd --manifest-path ../../Cargo.toml
 
     echo "=== Starting zenohd on ws/127.0.0.1:7448 ==="
     ../../target/release/zenohd -l ws/127.0.0.1:7448 &
@@ -54,9 +60,10 @@ run_session() {
 
 case "$SUITE" in
     basic)   run_basic ;;
+    runtime) run_runtime ;;
     session) run_session ;;
-    all)     run_basic; run_session ;;
-    *)       echo "Unknown suite: $SUITE (use basic, session, or all)"; exit 1 ;;
+    all)     run_basic; run_runtime; run_session ;;
+    *)       echo "Unknown suite: $SUITE (use basic, runtime, session, or all)"; exit 1 ;;
 esac
 
 echo "All requested tests passed."

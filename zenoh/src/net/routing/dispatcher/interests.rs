@@ -19,7 +19,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use zenoh_protocol::{
     core::Region,
     network::{
@@ -30,8 +29,6 @@ use zenoh_protocol::{
 };
 use zenoh_sync::get_mut_unchecked;
 use zenoh_task::CancellationToken;
-#[cfg(not(target_arch = "wasm32"))]
-use zenoh_util::Timed;
 
 use super::{face::FaceState, tables::TablesLock};
 use crate::net::routing::{
@@ -146,14 +143,8 @@ impl CurrentInterestCleanup {
             let rejection_token = pending_interest.rejection_token.clone();
             face.task_controller
                 .spawn_with_rt(zenoh_runtime::ZRuntime::Net, async move {
-                    #[cfg(not(target_arch = "wasm32"))]
                     tokio::select! {
-                        _ = tokio::time::sleep(cleanup.interests_timeout) => { cleanup.run().await }
-                        _ = cancellation_token.cancelled() => {}
-                        _ = rejection_token.cancelled() => { cleanup.execute(false).await }
-                    }
-                    #[cfg(target_arch = "wasm32")]
-                    tokio::select! {
+                        _ = zenoh_runtime::compat::sleep(cleanup.interests_timeout) => { cleanup.execute(true).await }
                         _ = cancellation_token.cancelled() => {}
                         _ = rejection_token.cancelled() => { cleanup.execute(false).await }
                     }
@@ -186,14 +177,6 @@ impl CurrentInterestCleanup {
                 });
             }
         }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[async_trait]
-impl Timed for CurrentInterestCleanup {
-    async fn run(&mut self) {
-        self.execute(true).await;
     }
 }
 
