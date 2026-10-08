@@ -696,7 +696,13 @@ impl Resource {
                         .face_ctxs
                         .entry(face.id)
                         .or_insert_with(|| Arc::new(FaceContext::new(face.clone())));
-                    let expr_id = face.get_next_local_id();
+                    let Some(expr_id) = get_mut_unchecked(face).get_next_local_id() else {
+                        // Expression mappings only compress wire expressions. Once
+                        // the 16-bit ID space is exhausted, keep routing with the
+                        // complete expression instead of blocking the router while
+                        // searching forever.
+                        return res.expr().to_string().into();
+                    };
                     get_mut_unchecked(ctx).local_expr_id = Some(expr_id);
                     get_mut_unchecked(face)
                         .local_mappings

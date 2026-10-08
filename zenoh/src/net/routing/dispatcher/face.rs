@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use zenoh_collections::IntHashMap;
 use zenoh_keyexpr::keyexpr;
 use zenoh_protocol::{
-    core::{Bound, ExprId, Region, Reliability, WhatAmI, WireExpr, ZenohIdProto},
+    core::{Bound, ExprId, Region, Reliability, WhatAmI, WireExpr, ZenohIdProto, EMPTY_EXPR_ID},
     network::{
         interest::{InterestId, InterestMode, InterestOptions},
         Mapping, Push, Request, RequestId, Response, ResponseFinal,
@@ -124,6 +124,7 @@ pub struct FaceState {
     pub(crate) pending_current_interests: HashMap<InterestId, PendingCurrentInterest>,
     pub(crate) local_mappings: IntHashMap<ExprId, Arc<Resource>>,
     pub(crate) remote_mappings: IntHashMap<ExprId, Arc<Resource>>,
+    pub(crate) next_local_mapping_id: ExprId,
     pub(crate) next_qid: RequestId,
     /// Pending queries sent to this face.
     ///
@@ -165,6 +166,7 @@ impl FaceStateBuilder {
             pending_current_interests: HashMap::new(),
             local_mappings: IntHashMap::new(),
             remote_mappings: IntHashMap::new(),
+            next_local_mapping_id: EMPTY_EXPR_ID + 1,
             next_qid: 0,
             pending_queries: HashMap::new(),
             mcast_group: None,
@@ -241,12 +243,29 @@ impl FaceState {
         }
     }
 
-    pub(crate) fn get_next_local_id(&self) -> ExprId {
-        let mut id = 1;
-        while self.local_mappings.contains_key(&id) || self.remote_mappings.contains_key(&id) {
-            id += 1;
+    pub(crate) fn get_next_local_id(&mut self) -> Option<ExprId> {
+        // ID 0 is reserved for an unmapped wire expression. If the two maps are
+        // dense enough that their (possibly overlapping) lengths cover the ID
+        // space, prefer an unmapped expression over a full scan. This is only a
+        // compression optimization, so declining to allocate an available ID is
+        // safe.
+        if self
+            .local_mappings
+            .len()
+            .saturating_add(self.remote_mappings.len())
+            >= ExprId::MAX as usize
+        {
+            return None;
         }
-        id
+
+        for _ in EMPTY_EXPR_ID + 1..=ExprId::MAX {
+            let id = self.next_local_mapping_id;
+            self.next_local_mapping_id = id.checked_add(1).unwrap_or(EMPTY_EXPR_ID + 1);
+            if !self.local_mappings.contains_key(&id) && !self.remote_mappings.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
     }
 
     pub(crate) fn update_interceptors_caches(&self, res: &mut Arc<Resource>) {
@@ -342,6 +361,48 @@ impl FaceState {
                 .expect("face in_interceptors should not be None when mcast_group is set")
                 .store(interceptor.into());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::{
+        primitives::DummyPrimitives,
+        routing::dispatcher::{region::RegionMap, resource::Resource},
+    };
+
+    #[test]
+    fn local_mapping_id_allocation_is_bounded_and_skips_remote_ids() {
+        let mut face = FaceStateBuilder::new(
+            0,
+            ZenohIdProto::default(),
+            Region::Local,
+            Bound::North,
+            Arc::new(DummyPrimitives),
+            RegionMap::<Box<()>>::default().map(|value| value as Box<dyn Any + Send + Sync>),
+        )
+        .build();
+        let resource = Resource::root();
+
+        assert_eq!(face.get_next_local_id(), Some(1));
+        face.local_mappings.insert(1, resource.clone());
+        face.remote_mappings.insert(2, resource.clone());
+        assert_eq!(face.get_next_local_id(), Some(3));
+        face.local_mappings.insert(3, resource.clone());
+
+        // Exercise wrap-around while preserving zero as the unmapped ID.
+        face.next_local_mapping_id = ExprId::MAX;
+        assert_eq!(face.get_next_local_id(), Some(ExprId::MAX));
+        face.local_mappings.insert(ExprId::MAX, resource.clone());
+        assert_eq!(face.get_next_local_id(), Some(4));
+
+        // Fill every usable ID. Exhaustion must return instead of wrapping and
+        // spinning forever.
+        for id in 4..ExprId::MAX {
+            face.local_mappings.insert(id, resource.clone());
+        }
+        assert_eq!(face.get_next_local_id(), None);
     }
 }
 
