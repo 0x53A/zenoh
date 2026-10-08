@@ -117,14 +117,27 @@ impl Face {
                     .filter(|hat| hat.remote_subscribers_of(ctx.tables, &res).is_some())
                     .collect_vec();
 
+                let fid = self.state.id;
                 if (*remaining).is_empty() {
                     for hat in tables.hats.values_mut() {
                         hat.unpropagate_subscriber(ctx.reborrow(), res.clone());
                     }
-                    Resource::clean(&mut res);
                 } else if let [last_owner] = &mut *remaining {
                     last_owner.unpropagate_last_non_owned_subscriber(ctx, res.clone())
                 }
+                // drop the face's context once it holds nothing any more
+                if res.face_ctxs.get(&fid).is_some_and(|c| {
+                    c.subs.is_none()
+                        && c.qabl.is_none()
+                        && !c.token
+                        && c.local_expr_id.is_none()
+                        && c.remote_expr_id.is_none()
+                }) {
+                    zenoh_sync::get_mut_unchecked(&mut res)
+                        .face_ctxs
+                        .remove(&fid);
+                }
+                Resource::clean(&mut res);
             }
         });
     }

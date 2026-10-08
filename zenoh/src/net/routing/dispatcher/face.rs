@@ -806,8 +806,12 @@ impl Primitives for Face {
                 }
                 get_mut_unchecked(&mut res).face_ctxs.remove(&src_fid);
                 Resource::clean(&mut res);
-            } else if let [last_owner] = &mut *remaining {
-                last_owner.unpropagate_last_non_owned_subscriber(ctx.reborrow(), res.clone())
+            } else {
+                if let [last_owner] = &mut *remaining {
+                    last_owner.unpropagate_last_non_owned_subscriber(ctx.reborrow(), res.clone())
+                }
+                get_mut_unchecked(&mut res).face_ctxs.remove(&src_fid);
+                Resource::clean(&mut res);
             }
         }
 
@@ -862,17 +866,21 @@ impl Primitives for Face {
             }
         }
 
-        for res in get_mut_unchecked(ctx.src_face).remote_mappings.values_mut() {
-            get_mut_unchecked(res).face_ctxs.remove(&src_fid);
-            Resource::clean(res);
+        // take the mappings out of the face before cleaning, so that a mapped parent whose
+        // child is cleaned first is no longer held by the mapping when the child's clean retries it
+        let face = get_mut_unchecked(ctx.src_face);
+        let mappings = face
+            .remote_mappings
+            .values()
+            .chain(face.local_mappings.values())
+            .cloned()
+            .collect_vec();
+        face.remote_mappings.clear();
+        face.local_mappings.clear();
+        for mut res in mappings {
+            get_mut_unchecked(&mut res).face_ctxs.remove(&src_fid);
+            Resource::clean(&mut res);
         }
-        get_mut_unchecked(ctx.src_face).remote_mappings.clear();
-
-        for res in get_mut_unchecked(ctx.src_face).local_mappings.values_mut() {
-            get_mut_unchecked(res).face_ctxs.remove(&src_fid);
-            Resource::clean(res);
-        }
-        get_mut_unchecked(ctx.src_face).local_mappings.clear();
 
         for interest in get_mut_unchecked(ctx.src_face).local_interests.values_mut() {
             if let Some(mut res) = interest.res.take() {
