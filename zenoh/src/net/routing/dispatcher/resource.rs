@@ -50,6 +50,8 @@ use crate::net::routing::{
 };
 
 pub(crate) type NodeId = u16;
+// Large wildcard match sets are expensive to scan once for every resource removed from a face.
+const MATCH_INDEX_THRESHOLD: usize = 32;
 
 /// [`NodeId`] value of [`network::ext::NodeIdType::DEFAULT`].
 pub(crate) const DEFAULT_NODE_ID: NodeId = network::ext::NodeIdType::<0>::DEFAULT.node_id;
@@ -323,6 +325,7 @@ pub(crate) type QueryRoutes = Routes<Arc<QueryTargetQablSet>>;
 
 pub(crate) struct ResourceContext {
     pub(crate) matches: Vec<Weak<Resource>>,
+    match_indices: Option<Box<IntHashMap<usize, usize>>>,
     pub(crate) hats: RegionMap<HatResourceContext>,
     pub(crate) data_routes: RwLock<DataRoutes>,
     #[cfg(feature = "stats")]
@@ -333,6 +336,7 @@ impl ResourceContext {
     pub(crate) fn new(hat: RegionMap<HatResourceContext>) -> ResourceContext {
         ResourceContext {
             matches: Vec::new(),
+            match_indices: None,
             hats: hat,
             data_routes: Default::default(),
             #[cfg(feature = "stats")]
@@ -342,6 +346,51 @@ impl ResourceContext {
 
     pub(crate) fn disable_data_routes(&mut self) {
         self.data_routes.get_mut().unwrap().clear();
+    }
+
+    fn set_matches(&mut self, matches: Vec<Weak<Resource>>) {
+        self.match_indices = Self::build_match_indices(&matches);
+        self.matches = matches;
+    }
+
+    fn push_match(&mut self, match_: Weak<Resource>) {
+        let index = self.matches.len();
+        self.matches.push(match_);
+        if let Some(indices) = self.match_indices.as_mut() {
+            indices.insert(Self::match_key(&self.matches[index]), index);
+        } else if self.matches.len() >= MATCH_INDEX_THRESHOLD {
+            self.match_indices = Self::build_match_indices(&self.matches);
+        }
+    }
+
+    fn remove_match(&mut self, res: &Arc<Resource>) {
+        let key = Arc::as_ptr(res) as usize;
+        let Some(indices) = self.match_indices.as_mut() else {
+            self.matches
+                .retain(|match_| Weak::as_ptr(match_) as usize != key);
+            return;
+        };
+        let Some(index) = indices.remove(&key) else {
+            return;
+        };
+        self.matches.swap_remove(index);
+        if index < self.matches.len() {
+            indices.insert(Self::match_key(&self.matches[index]), index);
+        }
+    }
+
+    fn build_match_indices(matches: &[Weak<Resource>]) -> Option<Box<IntHashMap<usize, usize>>> {
+        (matches.len() >= MATCH_INDEX_THRESHOLD).then(|| {
+            let mut indices = IntHashMap::default();
+            for (index, match_) in matches.iter().enumerate() {
+                indices.insert(Self::match_key(match_), index);
+            }
+            Box::new(indices)
+        })
+    }
+
+    fn match_key(match_: &Weak<Resource>) -> usize {
+        Weak::as_ptr(match_) as usize
     }
 }
 
@@ -546,8 +595,7 @@ impl Resource {
                         if !Arc::ptr_eq(&match_, res) {
                             let mutmatch = get_mut_unchecked(&mut match_);
                             if let Some(ctx) = mutmatch.ctx.as_mut() {
-                                ctx.matches
-                                    .retain(|x| !Arc::ptr_eq(&x.upgrade().unwrap(), res));
+                                ctx.remove_match(res);
                             }
                         }
                     }
@@ -909,10 +957,9 @@ impl Resource {
                 let mut match_ = match_.upgrade().unwrap();
                 get_mut_unchecked(&mut match_)
                     .context_mut()
-                    .matches
-                    .push(Arc::downgrade(res));
+                    .push_match(Arc::downgrade(res));
             }
-            get_mut_unchecked(res).context_mut().matches = matches;
+            get_mut_unchecked(res).context_mut().set_matches(matches);
         } else {
             tracing::error!("Call match_resource() on context less res {}", res.expr());
         }
@@ -1096,5 +1143,86 @@ pub(crate) fn register_expr_interest(
             .remote_key_interests
             .insert(id, None);
         drop(wtables);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resource_context() -> ResourceContext {
+        ResourceContext::new(
+            RegionMap::<Box<()>>::default()
+                .map(|_| HatResourceContext::new(Box::new(()) as Box<dyn Any + Send + Sync>)),
+        )
+    }
+
+    #[test]
+    fn large_match_sets_keep_constant_time_removal_index_consistent() {
+        let resources = (0..128).map(|_| Resource::root()).collect::<Vec<_>>();
+        let mut context = resource_context();
+        for resource in &resources {
+            context.push_match(Arc::downgrade(resource));
+        }
+
+        assert!(context.match_indices.is_some());
+        for resource in resources.iter().step_by(2) {
+            context.remove_match(resource);
+        }
+
+        assert_eq!(context.matches.len(), 64);
+        let indices = context.match_indices.as_ref().unwrap();
+        for (index, match_) in context.matches.iter().enumerate() {
+            assert_eq!(
+                indices.get(&ResourceContext::match_key(match_)),
+                Some(&index)
+            );
+        }
+        for resource in resources.iter().skip(1).step_by(2) {
+            context.remove_match(resource);
+        }
+        assert!(context.matches.is_empty());
+        assert!(indices_are_empty(&context));
+    }
+
+    #[test]
+    fn cleaning_many_resources_removes_them_from_a_wildcard_match_set() {
+        let mut root = Resource::root();
+        let mut wildcard = Arc::new(Resource::new(&root, "/**", Some(resource_context())));
+        get_mut_unchecked(&mut root)
+            .children
+            .insert(Child(wildcard.clone()));
+
+        const RESOURCE_COUNT: usize = 10_000;
+        let mut resources = Vec::with_capacity(RESOURCE_COUNT);
+        for index in 0..RESOURCE_COUNT {
+            let mut resource = Arc::new(Resource::new(
+                &root,
+                &format!("/{index}"),
+                Some(resource_context()),
+            ));
+            get_mut_unchecked(&mut root)
+                .children
+                .insert(Child(resource.clone()));
+            let resource_weak = Arc::downgrade(&resource);
+            get_mut_unchecked(&mut wildcard)
+                .context_mut()
+                .push_match(resource_weak.clone());
+            get_mut_unchecked(&mut resource)
+                .context_mut()
+                .set_matches(vec![Arc::downgrade(&wildcard), resource_weak]);
+            resources.push(resource);
+        }
+
+        for mut resource in resources {
+            Resource::clean(&mut resource);
+        }
+
+        assert!(wildcard.context().matches.is_empty());
+        assert_eq!(root.children.len(), 1);
+    }
+
+    fn indices_are_empty(context: &ResourceContext) -> bool {
+        context.match_indices.as_ref().unwrap().is_empty()
     }
 }
